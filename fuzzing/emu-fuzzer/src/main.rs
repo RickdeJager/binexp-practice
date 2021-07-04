@@ -1,3 +1,4 @@
+use std::path::Path;
 
 const PERM_READ : u8 = 1 << 0;
 const PERM_WRITE: u8 = 1 << 1;
@@ -216,21 +217,98 @@ impl Emulator {
             memory: self.memory.fork(),
         }
     }
+
+    /// Load a file into the emulators address space based on the provided sections.
+    fn load<P: AsRef<Path>>(&mut self, file_name: P, sections: &[Section]) -> Option<()> {
+
+        // Read the input file from disk
+        let contents = std::fs::read(file_name).ok()?;
+
+        // Next, load each section
+        for section in sections {
+            // Mark the memory as writable so we can load into it
+            self.memory.set_permissions(section.virt_addr, section.mem_size, Perm(PERM_WRITE))?;
+
+            // Write the file contents to memory
+            self.memory.write_from(section.virt_addr, 
+                &contents[section.file_offset..
+                          section.file_offset.checked_add(section.file_size)?])?;
+
+            // Pad with zeros
+            if section.mem_size > section.file_size {
+                let padding = vec![0u8; section.mem_size - section.file_size];
+                self.memory.write_from(
+                    VirtAddr(section.virt_addr.0.checked_add(section.file_size)?), 
+                    &padding);
+            }
+
+            // Set the permissions as specified in the Section struct.
+            self.memory.set_permissions(section.virt_addr, section.mem_size, section.permissions)?;
+
+            // Update the allocator beyond any sections we load, to ensure this memory can't
+            // be allocated again.
+            self.memory.cur_alloc = VirtAddr(std::cmp::max(
+                    self.memory.cur_alloc.0, 
+                    (section.virt_addr.0 + section.mem_size + 0xf) & !0xf
+            ));
+        }
+
+        Some(())
+    }
 }
+
+struct Section {
+    file_offset: usize,
+    virt_addr  : VirtAddr,
+    file_size  : usize,
+    mem_size   : usize,
+    permissions: Perm,
+}
+
 
 fn main() {
 
+/*
+ * readelf -l minimal
+Elf file type is EXEC (Executable file)
+Entry point 0x100c8
+There are 2 program headers, starting at offset 64
+
+Program Headers:
+  Type           Offset             VirtAddr           PhysAddr
+                 FileSiz            MemSiz              Flags  Align
+  LOAD           0x0000000000000000 0x0000000000010000 0x0000000000010000
+                 0x00000000000005b8 0x00000000000005b8  R E    0x1000
+  LOAD           0x00000000000005b8 0x00000000000115b8 0x00000000000115b8
+                 0x0000000000000780 0x00000000000007b8  RW     0x1000
+
+ Section to Segment mapping:
+  Segment Sections...
+   00     .text 
+   01     .eh_frame .init_array .fini_array .data .sdata .bss 
+
+*/
     let mut emu = Emulator::new(1024*1024);
-    let tmp = emu.memory.allocate(4).unwrap();
+    emu.load("./riscv/minimal", &[
+             Section {
+                file_offset: 0x0000000000000000,
+                virt_addr  : VirtAddr(0x0000000000010000),
+                file_size  : 0x00000000000005b8,
+                mem_size   : 0x00000000000005b8,
+                permissions: Perm(PERM_READ | PERM_EXEC),
+             },
+             Section {
+                file_offset: 0x00000000000005b8,
+                virt_addr  : VirtAddr(0x00000000000115b8),
+                file_size  : 0x0000000000000780,
+                mem_size   : 0x00000000000007b8,
+                permissions: Perm(PERM_READ | PERM_WRITE),
+             },
+    ]).unwrap();
 
-    emu.memory.write_from(tmp, b"XXXX").unwrap();
-
-    {
-        let mut forked = emu.fork();
-        for _ in 0..5_000_000 {
-            forked.memory.write_from(tmp, b"ABCD").unwrap();
-            forked.memory.reset(&emu.memory);
-        }
-    }
+    let mut tmp = [0u8; 4];
+    emu.memory.read_into(VirtAddr(0x100c8), &mut tmp);
+    print!("{:x?}\n", emu.memory.cur_alloc);
+    print!("{:x?}\n", tmp);
 
 }
