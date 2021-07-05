@@ -1,9 +1,13 @@
+#[allow(dead_code)]
+
 mod mmu;
 mod emu;
+#[macro_use]
+mod riscv;
 
 use mmu::{Perm, VirtAddr};
 use mmu::{PERM_WRITE, PERM_READ, PERM_RAW, PERM_EXEC};
-use emu::{Emulator, Register};
+use emu::{Loader, Emulator, Archs};
 
 
 pub struct Section {
@@ -36,8 +40,8 @@ Program Headers:
    01     .eh_frame .init_array .fini_array .data .sdata .bss 
 
 */
-    let mut emu = Emulator::new(1024*1024);
-    emu.load("./riscv/minimal", &[
+    let mut loader = Loader::new(1024*1024);
+    loader.load("./riscv/minimal", &[
              Section {
                 file_offset: 0x0000000000000000,
                 virt_addr  : VirtAddr(0x0000000000010000),
@@ -54,9 +58,27 @@ Program Headers:
              },
     ]).unwrap();
 
+    // Create a stack
+    let mut stack = loader.memory.allocate(32 * 1024).expect("Failed to allocate stack.");
+
+    // TODO; This is terrible, but will revisit later.
+    let tmp = [0u8; 8];
+    stack.0 -= 8;
+    loader.memory.write_from(stack, &tmp).unwrap(); // ARGC
+    stack.0 -= 8;
+    loader.memory.write_from(stack, &tmp).unwrap(); // ARGV
+    stack.0 -= 8;
+    loader.memory.write_from(stack, &tmp).unwrap(); // ARGP
+    stack.0 -= 8;
+    loader.memory.write_from(stack, &tmp).unwrap(); // AUXP
+
+    let mut emu = Emulator::new(Archs::RiscV, loader.memory.fork());
 
     // Set the emu's entry point
-    emu.set_reg(Register::Pc, 0x100c8);
+    emu.set_entry(0x100c8);
+    // Set the emu's stack pointer to point to our newly created stack pointer
+    emu.set_stackp(stack.0 as u64 - 8u64);
+
     emu.run();
 
 
