@@ -3,7 +3,7 @@ mod emu;
 
 use mmu::{Perm, VirtAddr};
 use mmu::{PERM_WRITE, PERM_READ, PERM_RAW, PERM_EXEC};
-use emu::{Emulator};
+use emu::{Emulator, Register};
 
 
 pub struct Section {
@@ -54,9 +54,10 @@ Program Headers:
              },
     ]).unwrap();
 
-    let mut tmp = [0u8; 4];
-    emu.memory.read_into(VirtAddr(0x100c8), &mut tmp);
-    print!("{:x?}\n", emu.memory.cur_alloc);
-    print!("{:x?}\n", tmp);
+
+    // Set the emu's entry point
+    emu.set_reg(Register::Pc, 0x100c8);
+    emu.run();
+
 
 }

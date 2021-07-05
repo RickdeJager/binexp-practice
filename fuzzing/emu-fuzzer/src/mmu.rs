@@ -1,3 +1,5 @@
+#[macro_use]
+
 pub const PERM_READ : u8 = 1 << 0;
 pub const PERM_WRITE: u8 = 1 << 1;
 pub const PERM_EXEC : u8 = 1 << 2;
@@ -19,6 +21,7 @@ pub struct Perm(pub u8);
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct VirtAddr(pub usize);
+
 
 /// The memory space for a single emu
 pub struct Mmu {
@@ -178,11 +181,16 @@ impl Mmu {
 
     /// Write bytes from `buf` into `addr`
     pub fn read_into(&self, addr: VirtAddr, buf: &mut [u8]) -> Option<()> {
+        self.read_into_perms(addr, buf, Perm(PERM_READ))
+    }
 
+    /// Write bytes from `buf` into `addr` and apply special permissions
+    pub fn read_into_perms(&self, addr: VirtAddr, buf: &mut [u8], perm: Perm) -> Option<()> {
         let perms = self.permissions.get(addr.0..addr.0.checked_add(buf.len())?)?;
 
-        // If we attempt to read a non-readable byte, return an error.
-        if perms.iter().any(|x| x.0 & PERM_READ == 0) {
+        // If we attempt to read a byte that lacks some of the required permissions,
+        // return an error.
+        if perms.iter().any(|x| (x.0 & perm.0) != perm.0) {
             return None;
         }
 
@@ -194,5 +202,4 @@ impl Mmu {
         Some(())
     }
 }
-
 
