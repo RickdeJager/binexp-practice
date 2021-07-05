@@ -65,12 +65,23 @@ Program Headers:
     let tmp = [0u8; 8];
     stack.0 -= 8;
     loader.memory.write_from(stack, &tmp).unwrap(); // ARGC
-    stack.0 -= 8;
+    stack.0 -= 16;
     loader.memory.write_from(stack, &tmp).unwrap(); // ARGV
-    stack.0 -= 8;
+    loader.memory.write_from(stack, &tmp).unwrap(); // ARGV
+    stack.0 -= 16;
     loader.memory.write_from(stack, &tmp).unwrap(); // ARGP
-    stack.0 -= 8;
+    loader.memory.write_from(stack, &tmp).unwrap(); // ARGP
+    stack.0 -= 16;
     loader.memory.write_from(stack, &tmp).unwrap(); // AUXP
+    loader.memory.write_from(stack, &tmp).unwrap(); // AUXP
+
+    //TODO; REMOVE
+    for _ in 0..10 {
+        stack.0 -= 16;
+        loader.memory.write_from(stack, &tmp).unwrap(); // AUXP
+        loader.memory.write_from(stack, &tmp).unwrap(); // AUXP
+    }
+
 
     let mut emu = Emulator::new(Archs::RiscV, loader.memory.fork());
 

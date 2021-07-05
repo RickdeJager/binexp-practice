@@ -228,7 +228,7 @@ impl Arch for RiscV {
         let inst = mmu_read_perms!(self.memory, VirtAddr(pc as usize), Perm(PERM_EXEC), u32)?;
 
         let opcode = inst & 0b1111111;
-        print!("Opcode: {:7b} PC: {:x?}\n", opcode, pc);
+        print!("Opcode: {:07b} PC: {:x?}\n", opcode, pc);
 
         match opcode {
             0b0110111 => {
@@ -250,6 +250,7 @@ impl Arch for RiscV {
                 self.set_register(inst.rd, pc.wrapping_add(4));
                 // Jump by adding to the PC reg
                 self.set_register(Register::Pc, pc.wrapping_add(inst.imm as i64 as u64));
+                return Some(());
             },
 
             0b1100111 => {
@@ -263,6 +264,7 @@ impl Arch for RiscV {
                         self.set_register(inst.rd, pc.wrapping_add(4));
                         // Jump to target
                         self.set_register(Register::Pc, target);
+                        return Some(());
                     },
                     _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
                                  inst.funct3, opcode)},
@@ -282,6 +284,7 @@ impl Arch for RiscV {
                         if rs1 == rs2 {
                             self.set_register(Register::Pc, 
                                               pc.wrapping_add(inst.imm as i64 as u64));
+                            return Some(());
                         }
                     },
                     0b001 => {
@@ -289,6 +292,7 @@ impl Arch for RiscV {
                         if rs1 != rs2 {
                             self.set_register(Register::Pc, 
                                               pc.wrapping_add(inst.imm as i64 as u64));
+                            return Some(());
                         }
                     },
                     0b100 => {
@@ -296,6 +300,7 @@ impl Arch for RiscV {
                         if (rs1 as i64) < (rs2 as i64) {
                             self.set_register(Register::Pc, 
                                               pc.wrapping_add(inst.imm as i64 as u64));
+                            return Some(());
                         }
                     },
                     0b101 => {
@@ -303,6 +308,7 @@ impl Arch for RiscV {
                         if rs1 as i64 >= rs2 as i64 {
                             self.set_register(Register::Pc, 
                                               pc.wrapping_add(inst.imm as i64 as u64));
+                            return Some(());
                         }
                     },
                     0b110 => {
@@ -310,6 +316,7 @@ impl Arch for RiscV {
                         if (rs1 as u64) < (rs2 as u64) {
                             self.set_register(Register::Pc, 
                                               pc.wrapping_add(inst.imm as i64 as u64));
+                            return Some(());
                         }
                     },
                     0b111 => {
@@ -317,6 +324,7 @@ impl Arch for RiscV {
                         if (rs1 as u64) >= (rs2 as u64) {
                             self.set_register(Register::Pc, 
                                               pc.wrapping_add(inst.imm as i64 as u64));
+                            return Some(());
                         }
                     },
                     _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
@@ -331,6 +339,7 @@ impl Arch for RiscV {
                 // Compute the address
                 let addr = VirtAddr(self.get_register(inst.rs1)
                                     .wrapping_add(inst.imm as i64 as u64) as usize);
+
                 match inst.funct3 {
                     0b000 => {
                         // LB: Load byte
@@ -357,6 +366,16 @@ impl Arch for RiscV {
                         let val = mmu_read!(self.memory, addr, u16)?;
                         self.set_register(inst.rd, val as u64);
                     },
+                    0b110 => {
+                        // LWU: Load word unsigned
+                        let val = mmu_read!(self.memory, addr, u32)?;
+                        self.set_register(inst.rd, val as u64);
+                    },
+                    0b011 => {
+                        // LD: Load double word
+                        let val = mmu_read!(self.memory, addr, i64)?;
+                        self.set_register(inst.rd, val as u64);
+                    },
                     _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
                                  inst.funct3, opcode)},
                 }
@@ -371,17 +390,22 @@ impl Arch for RiscV {
                 match inst.funct3 {
                     0b000 => {
                         // SB: Store byte
-                        let val = self.get_register(inst.rs2) as i8;
+                        let val = self.get_register(inst.rs2) as u8;
                         mmu_write!(self.memory, addr, val)?;
                     },
                     0b001 => {
                         // SH: Store half word
-                        let val = self.get_register(inst.rs2) as i16;
+                        let val = self.get_register(inst.rs2) as u16;
                         mmu_write!(self.memory, addr, val)?;
                     },
                     0b010 => {
                         // SW: Store word
-                        let val = self.get_register(inst.rs2) as i32;
+                        let val = self.get_register(inst.rs2) as u32;
+                        mmu_write!(self.memory, addr, val)?;
+                    },
+                    0b011 => {
+                        // SD: Store double word
+                        let val = self.get_register(inst.rs2) as u64;
                         mmu_write!(self.memory, addr, val)?;
                     },
                     _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
@@ -478,7 +502,7 @@ impl Arch for RiscV {
                     },
                     (0b0000000, 0b001) => {
                         // SLL: Shift-left logical
-                        let shamt = rs2 & 0b1111111;
+                        let shamt = rs2 & 0b11111;
                         self.set_register(inst.rd, rs1 << shamt);
                     },
                     (0b0000000, 0b010) => {
@@ -503,12 +527,12 @@ impl Arch for RiscV {
                     },
                     (0b0000000, 0b101) => {
                         // SRL: Shift-right locical
-                        let shamt = rs2 & 0b1111111;
+                        let shamt = rs2 & 0b11111;
                         self.set_register(inst.rd, rs1 >> shamt);
                     },
                     (0b0100000, 0b101) => {
                         // SRA: Shift-right arith.
-                        let shamt = rs2 & 0b1111111;
+                        let shamt = rs2 & 0b11111;
                         self.set_register(inst.rd, ((rs1 as i64) >> shamt) as u64);
                     },
                     (0b0000000, 0b110) => {
@@ -524,6 +548,85 @@ impl Arch for RiscV {
                             inst.funct7, inst.funct3, opcode)},
                 }
             },
+            0b0011011 => {
+                // 64 bit register-immediate.
+                let inst = Itype::from(inst);
+                let rs1 = self.get_register(inst.rs1) as i32;
+                let imm = inst.imm;
+
+                match inst.funct3 {
+                    0b000 => {
+                        // ADDIW: Add immediate to register
+                        self.set_register(inst.rd, rs1.wrapping_add(imm) as i32 as i64 as u64);
+                    },
+                    0b001 => {
+                        let mode = (inst.imm >> 5) & 0b1111111;
+                        match mode {
+                            0b000000 => {
+                                // SLLI: Shift-left logical immediate
+                                let shamt = inst.imm & 0b11111;
+                                self.set_register(inst.rd, (rs1 << shamt) as i32 as i64 as u64);
+                            },
+                            _ => panic!("Unknown shift mode in opcode {:#09b}\n", opcode),
+                        }
+                    },
+                    0b101 => {
+                        let mode = (inst.imm >> 5) & 0b1111111;
+                        let shamt = inst.imm & 0b11111;
+                        match mode {
+                            0b000000 => {
+                                // SRLIW: Shift-right logical immediate
+                                self.set_register(inst.rd, (rs1 >> shamt) as i32 as i64 as u64);
+                            },
+                            0b010000 => {
+                                // SRAIW: Shift-right arith immediate
+                                self.set_register(inst.rd, ((rs1 as i32) >> shamt) as i64 as u64);
+                            },
+                            _ => panic!("Unknown shift mode in opcode {:#09b}\n", opcode),
+                        };
+                    },
+                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
+                                 inst.funct3, opcode)},
+                }
+            },
+
+            0b0111011 => {
+                // Register-Register operations (64 bit)
+                let inst = Rtype::from(inst);
+
+                let rs1 = self.get_register(inst.rs1) as u32;
+                let rs2 = self.get_register(inst.rs2) as u32;
+
+                match (inst.funct7, inst.funct3) {
+                    (0b0000000, 0b000) => {
+                        // ADDW: Adds two registers, stores result in rd
+                        self.set_register(inst.rd, rs1.wrapping_add(rs2) as i32 as i64 as u64);
+                    },
+                    (0b0100000, 0b000) => {
+                        // SUBW: Subtracts two registers, stores result in rd
+                        self.set_register(inst.rd, rs1.wrapping_sub(rs2) as i32 as i64 as u64);
+                    },
+                    (0b0000000, 0b001) => {
+                        // SLLW: Shift-left logical
+                        let shamt = rs2 & 0b11111;
+                        self.set_register(inst.rd, (rs1 << shamt) as i32 as i64 as u64);
+                    },
+                    (0b0000000, 0b101) => {
+                        // SRLW: Shift-right locical
+                        let shamt = rs2 & 0b11111;
+                        self.set_register(inst.rd, (rs1 >> shamt) as i32 as i64 as u64);
+                    },
+                    (0b0100000, 0b101) => {
+                        // SRAW: Shift-right arith.
+                        let shamt = rs2 & 0b11111;
+                        self.set_register(inst.rd, ((rs1 as i32) >> shamt) as i64 as u64);
+                    }
+                    _ => {panic!(
+                            "Unknown (funct7, funct3): ({:#07b}, {:#03b}) in opcode: {:#09b}\n", 
+                            inst.funct7, inst.funct3, opcode)},
+                }
+            },
+
             0b0001111 => {
                 let inst = Itype::from(inst);
                 match inst.funct3 {
@@ -536,6 +639,7 @@ impl Arch for RiscV {
             0b1110011 => {
                 if        inst == 0b00000000000000000000000001110011 {
                     // ECALL
+                    panic!("Syscall");
                 } else if inst == 0b00000000000100000000000001110011 {
                     // EBREAK
                 } else {
@@ -548,9 +652,7 @@ impl Arch for RiscV {
 
         // Update the program counter to the next instruction
         self.set_register(Register::Pc, pc.wrapping_add(4));
-
         Some(())
-
     }
 }
 
@@ -627,7 +729,7 @@ impl From<u32> for Btype {
     fn from(inst: u32) -> Self {
 
         let imm12  = (inst >> 31) & 0b1;
-        let imm105 = (inst >> 25) & 0b11111;
+        let imm105 = (inst >> 25) & 0b111111;
         let imm41  = (inst >> 8)  & 0b1111;
         let imm11  = (inst >> 7)  & 0b1;
 
