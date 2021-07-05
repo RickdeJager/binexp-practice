@@ -1,4 +1,4 @@
-#[macro_use]
+use crate::emu::VmExit;
 
 pub const PERM_READ : u8 = 1 << 0;
 pub const PERM_WRITE: u8 = 1 << 1;
@@ -126,12 +126,14 @@ impl Mmu {
     }
 
     /// Write bytes from `buf` into `addr`
-    pub fn write_from(&mut self, addr: VirtAddr, buf: &[u8]) -> Option<()> {
+    pub fn write_from(&mut self, addr: VirtAddr, buf: &[u8]) -> Result<(), VmExit> {
     
         // First, check the permissions bits
         let mut has_raw = false;
         // Get a mutable ref to permissions so we can update them
-        let perms = self.permissions.get_mut(addr.0..addr.0.checked_add(buf.len())?)?;
+        let perms = self.permissions.get_mut(addr.0..addr.0.checked_add(buf.len())
+                    .ok_or(VmExit::AddressIntegerOverflow)?)
+                    .ok_or(VmExit::AddressMiss(addr, buf.len()))?;
 
         if !perms.iter().all(|x| {
             // Check if we pass any RAW bits along the way.
@@ -140,12 +142,14 @@ impl Mmu {
             (x.0 & PERM_WRITE) != 0
         }) { 
             // Failed to write because at least on byte was missing write perms
-            return None;
+            return Err(VmExit::WriteFault(addr, buf.len()));
         }
 
         // Do the actual write operation
         self.memory
-            .get_mut(addr.0..addr.0.checked_add(buf.len())?)?
+            .get_mut(addr.0..addr.0.checked_add(buf.len())
+                    .ok_or(VmExit::AddressIntegerOverflow)?)
+                    .ok_or(VmExit::AddressMiss(addr, buf.len()))?
             .copy_from_slice(buf);
 
         // Mark dirty blocks
@@ -174,32 +178,35 @@ impl Mmu {
                 .filter(|x| (x.0 & PERM_RAW) != 0)
                 .for_each(|x| {*x = Perm(x.0 | PERM_READ)});
         }
-
-
-        Some(())
+        Ok(())
     }
 
     /// Write bytes from `buf` into `addr`
-    pub fn read_into(&self, addr: VirtAddr, buf: &mut [u8]) -> Option<()> {
+    pub fn read_into(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<(), VmExit> {
         self.read_into_perms(addr, buf, Perm(PERM_READ))
     }
 
     /// Write bytes from `buf` into `addr` and apply special permissions
-    pub fn read_into_perms(&self, addr: VirtAddr, buf: &mut [u8], perm: Perm) -> Option<()> {
-        let perms = self.permissions.get(addr.0..addr.0.checked_add(buf.len())?)?;
+    pub fn read_into_perms(&self, addr: VirtAddr, buf: &mut [u8], perm: Perm) 
+            -> Result<(), VmExit> {
+
+        let perms = self.permissions.get(addr.0..addr.0.checked_add(buf.len())
+                    .ok_or(VmExit::AddressIntegerOverflow)?)
+                    .ok_or(VmExit::AddressMiss(addr, buf.len()))?;
 
         // If we attempt to read a byte that lacks some of the required permissions,
         // return an error.
         if perms.iter().any(|x| (x.0 & perm.0) != perm.0) {
-            return None;
+            return Err(VmExit::ReadFault(addr, buf.len()));
         }
 
         // Otherwise, attempt the read.
         buf.copy_from_slice(
-            self.memory.get(addr.0..addr.0.checked_add(buf.len())?)?
+            self.memory.get(addr.0..addr.0.checked_add(buf.len())
+                    .ok_or(VmExit::AddressIntegerOverflow)?)
+                    .ok_or(VmExit::AddressMiss(addr, buf.len()))?
         );
-
-        Some(())
+        Ok(())
     }
 }
 

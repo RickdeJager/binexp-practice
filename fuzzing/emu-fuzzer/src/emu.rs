@@ -1,8 +1,7 @@
 use std::path::Path;
 
 use crate::Section;
-use crate::mmu::{Mmu, Perm, VirtAddr};
-use crate::mmu::{PERM_WRITE, PERM_READ, PERM_RAW, PERM_EXEC};
+use crate::mmu::{Mmu, Perm, VirtAddr, PERM_WRITE};
 use crate::riscv;
 
 #[repr(u8)]
@@ -16,7 +15,7 @@ pub trait PreArch: Arch {
 }
 
 pub trait Arch {
-    fn tick(&mut self) -> Option<()>;
+    fn tick(&mut self) -> Result<(), VmExit>;
     fn get_register_raw(&self, reg: usize) -> Option<u64>;
     fn set_register_raw(&mut self, reg: usize, value: u64) -> Option<()>;
     fn set_entry(&mut self, value: u64);
@@ -57,14 +56,14 @@ impl Loader {
             // Write the file contents to memory
             self.memory.write_from(section.virt_addr, 
                 &contents[section.file_offset..
-                          section.file_offset.checked_add(section.file_size)?])?;
+                          section.file_offset.checked_add(section.file_size)?]).ok()?;
 
             // Pad with zeros
             if section.mem_size > section.file_size {
                 let padding = vec![0u8; section.mem_size - section.file_size];
                 self.memory.write_from(
                     VirtAddr(section.virt_addr.0.checked_add(section.file_size)?), 
-                    &padding);
+                    &padding).ok()?;
             }
 
             // Set the permissions as specified in the Section struct.
@@ -80,6 +79,31 @@ impl Loader {
 
         Some(())
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum VmExit {
+
+    /// Clean exit, as requested by the Guest.
+    Exit(u64),
+
+    /// Calling this Syscall would trigger an integer overflow.
+    SyscallIntegerOverflow,
+
+    /// The VM called a syscall that we don't have a handler for.
+    SyscallNotImplemented(u64),
+
+    /// A Read fault occured at `addr` with `length`.
+    ReadFault(VirtAddr, usize),
+
+    /// A Write fault occured at `addr` with `length`.
+    WriteFault(VirtAddr, usize),
+
+    /// The Address overflowed while reading/writing.
+    AddressIntegerOverflow,
+
+    /// Requested memomry is out of bounds.
+    AddressMiss(VirtAddr, usize),
 }
 
 pub struct Emulator {
@@ -107,10 +131,14 @@ impl Emulator {
         self.arch.set_stackp(stackp);
     }
 
-    pub fn run(&mut self) -> Option<()>{
-        loop {
-            self.arch.tick()?;
-        }
+    pub fn run(&mut self) {
+        let exit = loop {
+            if let Err(exit)  = self.arch.tick(){
+                break exit;
+            }
+        };
+
+        println!("VM exited due to: {:?}", exit);
     }
 }
 

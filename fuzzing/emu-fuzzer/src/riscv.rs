@@ -1,8 +1,8 @@
 #[allow(dead_code)]
 
-use crate::emu::{Arch, PreArch};
+use crate::emu::{Arch, PreArch, VmExit};
 use crate::mmu::{Mmu, Perm, VirtAddr};
-use crate::mmu::{PERM_WRITE, PERM_READ, PERM_RAW, PERM_EXEC};
+use crate::mmu::{PERM_READ, PERM_EXEC};
 
 use std::convert::TryFrom;
 
@@ -28,7 +28,7 @@ macro_rules! mmu_read_perms {
         {
             let mut tmp = [0u8; get_type_len!($type)];
             $mmu.read_into_perms($addr, &mut tmp, $perms)?;
-            Some(<$type>::from_le_bytes(tmp))
+            Ok(<$type>::from_le_bytes(tmp))
         }
     };
 }
@@ -39,7 +39,7 @@ macro_rules! mmu_read {
         {
             let mut tmp = [0u8; get_type_len!($type)];
             $mmu.read_into_perms($addr, &mut tmp, Perm(PERM_READ))?;
-            Some(<$type>::from_le_bytes(tmp))
+            Ok(<$type>::from_le_bytes(tmp))
         }
     };
 }
@@ -49,8 +49,7 @@ macro_rules! mmu_write {
     ($mmu: expr, $addr: expr, $value: expr) => {
         {
             let tmp = $value.to_le_bytes();
-            $mmu.write_from($addr, &tmp)?;
-            Some(())
+            $mmu.write_from($addr, &tmp)
         }
     };
 }
@@ -180,6 +179,15 @@ impl RiscV {
         }
         0
     }
+
+    fn handle_syscall(&mut self) -> Result<(), VmExit> {
+        let syscall = self.get_register(Register::A7);
+        return match syscall {
+            93 => Err(VmExit::Exit(self.get_register(Register::A0))),
+            94 => Err(VmExit::Exit(self.get_register(Register::A0))),
+             _ => Err(VmExit::SyscallNotImplemented(syscall)),
+        }
+    }
 }
 
 impl Arch for RiscV {
@@ -221,14 +229,15 @@ impl Arch for RiscV {
         self.memory.fork()
     }
 
-    fn tick(&mut self) -> Option<()> {
+    fn tick(&mut self) -> Result<(), VmExit> {
         // Fetch the current PC.
         let pc = self.get_register(Register::Pc);
         // Fetch the current instruction
-        let inst = mmu_read_perms!(self.memory, VirtAddr(pc as usize), Perm(PERM_EXEC), u32)?;
+        let addr = VirtAddr(pc as usize);
+        let inst = mmu_read_perms!(self.memory, addr, Perm(PERM_EXEC), u32)?;
 
         let opcode = inst & 0b1111111;
-        print!("Opcode: {:07b} PC: {:x?}\n", opcode, pc);
+//DEBUG        print!("Opcode: {:07b} PC: {:x?}\n", opcode, pc);
 
         match opcode {
             0b0110111 => {
@@ -250,7 +259,7 @@ impl Arch for RiscV {
                 self.set_register(inst.rd, pc.wrapping_add(4));
                 // Jump by adding to the PC reg
                 self.set_register(Register::Pc, pc.wrapping_add(inst.imm as i64 as u64));
-                return Some(());
+                return Ok(());
             },
 
             0b1100111 => {
@@ -264,7 +273,7 @@ impl Arch for RiscV {
                         self.set_register(inst.rd, pc.wrapping_add(4));
                         // Jump to target
                         self.set_register(Register::Pc, target);
-                        return Some(());
+                        return Ok(());
                     },
                     _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
                                  inst.funct3, opcode)},
@@ -284,7 +293,7 @@ impl Arch for RiscV {
                         if rs1 == rs2 {
                             self.set_register(Register::Pc, 
                                               pc.wrapping_add(inst.imm as i64 as u64));
-                            return Some(());
+                            return Ok(());
                         }
                     },
                     0b001 => {
@@ -292,7 +301,7 @@ impl Arch for RiscV {
                         if rs1 != rs2 {
                             self.set_register(Register::Pc, 
                                               pc.wrapping_add(inst.imm as i64 as u64));
-                            return Some(());
+                            return Ok(());
                         }
                     },
                     0b100 => {
@@ -300,7 +309,7 @@ impl Arch for RiscV {
                         if (rs1 as i64) < (rs2 as i64) {
                             self.set_register(Register::Pc, 
                                               pc.wrapping_add(inst.imm as i64 as u64));
-                            return Some(());
+                            return Ok(());
                         }
                     },
                     0b101 => {
@@ -308,7 +317,7 @@ impl Arch for RiscV {
                         if rs1 as i64 >= rs2 as i64 {
                             self.set_register(Register::Pc, 
                                               pc.wrapping_add(inst.imm as i64 as u64));
-                            return Some(());
+                            return Ok(());
                         }
                     },
                     0b110 => {
@@ -316,7 +325,7 @@ impl Arch for RiscV {
                         if (rs1 as u64) < (rs2 as u64) {
                             self.set_register(Register::Pc, 
                                               pc.wrapping_add(inst.imm as i64 as u64));
-                            return Some(());
+                            return Ok(());
                         }
                     },
                     0b111 => {
@@ -324,7 +333,7 @@ impl Arch for RiscV {
                         if (rs1 as u64) >= (rs2 as u64) {
                             self.set_register(Register::Pc, 
                                               pc.wrapping_add(inst.imm as i64 as u64));
-                            return Some(());
+                            return Ok(());
                         }
                     },
                     _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
@@ -639,7 +648,7 @@ impl Arch for RiscV {
             0b1110011 => {
                 if        inst == 0b00000000000000000000000001110011 {
                     // ECALL
-                    panic!("Syscall");
+                    self.handle_syscall()?;
                 } else if inst == 0b00000000000100000000000001110011 {
                     // EBREAK
                 } else {
@@ -652,9 +661,10 @@ impl Arch for RiscV {
 
         // Update the program counter to the next instruction
         self.set_register(Register::Pc, pc.wrapping_add(4));
-        Some(())
+        Ok(())
     }
 }
+
 
 struct Utype {
     imm: i32,
