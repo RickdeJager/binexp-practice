@@ -1,8 +1,10 @@
 #[allow(dead_code)]
 
+#[macro_use]
+// MMU defines macro's for reading/writing integer types, so must be pulled in
+// before any other modules are pulled in.
 mod mmu;
 mod emu;
-#[macro_use]
 mod riscv;
 
 use mmu::{Perm, VirtAddr};

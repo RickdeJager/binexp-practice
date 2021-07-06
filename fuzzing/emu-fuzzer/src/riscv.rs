@@ -6,54 +6,6 @@ use crate::mmu::{PERM_READ, PERM_EXEC};
 
 use std::convert::TryFrom;
 
-
-// TODO; Move these macro's into MMU
-/// Small little helper macro to get type lengths at compile time
-macro_rules! get_type_len {
-    (u8)   => {1};
-    (u16)  => {2};
-    (u32)  => {4};
-    (u64)  => {8};
-    (u128) => {16};
-    (i8)   => {1};
-    (i16)  => {2};
-    (i32)  => {4};
-    (i64)  => {8};
-    (i128) => {16};
-}
-
-/// Macro to read a value from memory while honouring the perms
-macro_rules! mmu_read_perms {
-    ($mmu: expr, $addr: expr, $perms: expr, $type: tt) => {
-        {
-            let mut tmp = [0u8; get_type_len!($type)];
-            $mmu.read_into_perms($addr, &mut tmp, $perms)?;
-            Ok(<$type>::from_le_bytes(tmp))
-        }
-    };
-}
-
-/// Macro to read a value from memory with PERM_READ
-macro_rules! mmu_read {
-    ($mmu: expr, $addr: expr, $type: tt) => {
-        {
-            let mut tmp = [0u8; get_type_len!($type)];
-            $mmu.read_into_perms($addr, &mut tmp, Perm(PERM_READ))?;
-            Ok(<$type>::from_le_bytes(tmp))
-        }
-    };
-}
-
-/// Macro to write a value to memory
-macro_rules! mmu_write {
-    ($mmu: expr, $addr: expr, $value: expr) => {
-        {
-            let tmp = $value.to_le_bytes();
-            $mmu.write_from($addr, &tmp)
-        }
-    };
-}
-
 /// 64 bit RISC-V registers
 const NUM_REGISTERS: usize = 33;
 /// See: Chapter 25; RISC-V Assembly Programmer’s Handbook
