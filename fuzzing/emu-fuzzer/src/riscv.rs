@@ -4,6 +4,8 @@ use crate::emu::{Arch, PreArch, VmExit};
 use crate::mmu::{Mmu, Perm, VirtAddr};
 use crate::mmu::{PERM_READ, PERM_EXEC};
 
+use crate::syscall;
+
 use std::convert::TryFrom;
 
 /// 64 bit RISC-V registers
@@ -132,12 +134,14 @@ impl RiscV {
         0
     }
 
+    /// Translate RiscV syscall numbers into the proper syscall handler,
+    /// and arguments / return values.
     fn handle_syscall(&mut self) -> Result<(), VmExit> {
-        let syscall = self.get_register(Register::A7);
-        return match syscall {
-            93 => Err(VmExit::Exit(self.get_register(Register::A0))),
-            94 => Err(VmExit::Exit(self.get_register(Register::A0))),
-             _ => Err(VmExit::SyscallNotImplemented(syscall)),
+        let nr_syscall = self.get_register(Register::A7);
+        return match nr_syscall {
+            93 => syscall::sys_exit(self.get_register(Register::A0)),
+            94 => syscall::sys_exit(self.get_register(Register::A0)),
+             _ => Err(VmExit::SyscallNotImplemented(nr_syscall)),
         }
     }
 }
