@@ -1,5 +1,3 @@
-#[allow(dead_code)]
-
 #[macro_use]
 // MMU defines macro's for reading/writing integer types, so must be pulled in
 // before any other modules are pulled in.
@@ -11,6 +9,8 @@ mod syscall;
 use mmu::{Mmu, Perm, VirtAddr};
 use mmu::{PERM_WRITE, PERM_READ, PERM_EXEC};
 use emu::{Emulator, Archs};
+
+pub const ALLOW_GUEST_PRINT: bool = false;
 
 
 /// Load an elf, return the entry point on success.
@@ -66,34 +66,55 @@ fn load_elf(binary_path: &str, mmu: &mut Mmu) -> Option<u64> {
 }
 
 fn main() {
-    let binary_path = "./riscv/minimal";
-    let mmu_size = 1024 * 1024;
+    let binary_path = "./riscv/echo-argv";
+    let mmu_size   = 1024 * 1024;
+    let stack_size = 1024 * 64;
     let mut memory = Mmu::new(mmu_size);
     let entryp = load_elf(binary_path, &mut memory).expect("Failed to parse ELF.");
     // Create a stack
-    let mut stack = memory.allocate(32 * 1024).expect("Failed to allocate stack.");
+    let mut stack = memory.allocate(stack_size).expect("Failed to allocate stack.");
 
-    // TODO; This is terrible, but will revisit later.
-    let tmp8  = [0u8; 8];
-    let tmp16 = [0u8; 16];
-    stack.0 -= 8;
-    memory.write_from(stack, &tmp8).unwrap(); // ARGC
-    stack.0 -= 16;
-    memory.write_from(stack, &tmp16).unwrap(); // ARGV
-    stack.0 -= 16;
-    memory.write_from(stack, &tmp16).unwrap(); // ARGP
-    stack.0 -= 16;
-    memory.write_from(stack, &tmp16).unwrap(); // AUXP
-    stack.0 -= 16;
-    memory.write_from(stack, &tmp16).unwrap();
+    // Set the initial stack pointer to the end of the stack.
+    stack.0 += stack_size;
 
+    /// Push an integer onto the stack
+    macro_rules! push_i {
+        ($a: expr) => {
+            let tmp = $a.to_le_bytes();
+            stack.0 -= tmp.len();
+            memory.write_from(stack, &tmp).expect("Failed to push to stack.");
+        }
+    }
+
+    let argv = vec!["echo-argv", "Let's", "echo", "some", "values"];
+
+    push_i!(0u64); // AUXP
+    push_i!(0u64); // ENVP
+    push_i!(0u64); // ARGV-end
+    for &item in argv.iter().rev() {
+        let tmp = item.as_bytes();
+        // Some functions like strlen, will batch read values, so we need to pad to the
+        // next 0xf alligned string length.
+        let alloc_len = (tmp.len() + 1 + 0xf) & !0xf;
+        // Alloc some space for this argument
+        let arg = memory.allocate(alloc_len).expect("Failed to allocate argument");
+
+        memory.write_from(arg, tmp).expect("Failed to write argument");
+        // Null terminate and add padding (which clears RAW bit)
+        memory.write_from(VirtAddr(arg.0 + tmp.len()), &vec![0u8; alloc_len - tmp.len()])
+            .expect("Failed to terminate argument");
+
+        // push the argv pointer onto the stack
+        push_i!(arg.0);
+    }
+    push_i!(argv.len() as u64); // ARGC
 
     let mut emu = Emulator::new(Archs::RiscV, memory.fork());
 
     // Set the emu's entry point
     emu.set_entry(entryp);
     // Set the emu's stack pointer to point to our newly created stack pointer
-    emu.set_stackp(stack.0 as u64 - 8u64);
+    emu.set_stackp(stack.0 as u64);
 
     emu.run();
 

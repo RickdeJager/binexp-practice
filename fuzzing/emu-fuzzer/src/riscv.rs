@@ -53,16 +53,16 @@ impl Register {
     pub fn from_u32(a: u32) -> Option<Self> {
         // pain.
         match a {
-            0 => Some(Register::Zero),
-            1 => Some(Register::Ra),
-            2 => Some(Register::Sp),
-            3 => Some(Register::Gp),
-            4 => Some(Register::Tp),
-            5 => Some(Register::T0),
-            6 => Some(Register::T1),
-            7 => Some(Register::T2),
-            8 => Some(Register::S0),
-            9 => Some(Register::S1),
+             0 => Some(Register::Zero),
+             1 => Some(Register::Ra),
+             2 => Some(Register::Sp),
+             3 => Some(Register::Gp),
+             4 => Some(Register::Tp),
+             5 => Some(Register::T0),
+             6 => Some(Register::T1),
+             7 => Some(Register::T2),
+             8 => Some(Register::S0),
+             9 => Some(Register::S1),
             10 => Some(Register::A0),
             11 => Some(Register::A1),
             12 => Some(Register::A2),
@@ -86,7 +86,7 @@ impl Register {
             30 => Some(Register::T5),
             31 => Some(Register::T6),
             32 => Some(Register::Pc),
-            _ => None,
+             _ => None,
         }
     }
     
@@ -136,11 +136,23 @@ impl RiscV {
 
     /// Translate RiscV syscall numbers into the proper syscall handler,
     /// and arguments / return values.
-    fn handle_syscall(&mut self) -> Result<(), VmExit> {
+    fn handle_syscall(&mut self) -> Result<i64, VmExit> {
         let nr_syscall = self.get_register(Register::A7);
+
+        let a0 = self.get_register(Register::A0);
+        let a1 = self.get_register(Register::A1);
+        let a2 = self.get_register(Register::A2);
+
         return match nr_syscall {
-            93 => syscall::sys_exit(self.get_register(Register::A0)),
-            94 => syscall::sys_exit(self.get_register(Register::A0)),
+            64  => {
+                syscall::write(&self.memory, a0 as i64, VirtAddr(a1 as usize), a2)
+            },
+            93  => syscall::sys_exit(a0),
+            94  => syscall::sys_exit(a0),
+            214 => {
+                let increment = self.get_register(Register::A0) as i64;
+                syscall::sbrk(&mut self.memory, increment)
+            },
              _ => Err(VmExit::SyscallNotImplemented(nr_syscall)),
         }
     }
@@ -193,7 +205,8 @@ impl Arch for RiscV {
         let inst = mmu_read_perms!(self.memory, addr, Perm(PERM_EXEC), u32)?;
 
         let opcode = inst & 0b1111111;
-//DEBUG        print!("Opcode: {:07b} PC: {:x?}\n", opcode, pc);
+        //DEBUG
+      //  print!("Opcode: {:07b} PC: {:x?}\n", opcode, pc);
 
         match opcode {
             0b0110111 => {
@@ -527,7 +540,7 @@ impl Arch for RiscV {
                     0b001 => {
                         let mode = (inst.imm >> 5) & 0b1111111;
                         match mode {
-                            0b000000 => {
+                            0b0000000 => {
                                 // SLLI: Shift-left logical immediate
                                 let shamt = inst.imm & 0b11111;
                                 self.set_register(inst.rd, (rs1 << shamt) as i32 as i64 as u64);
@@ -539,11 +552,11 @@ impl Arch for RiscV {
                         let mode = (inst.imm >> 5) & 0b1111111;
                         let shamt = inst.imm & 0b11111;
                         match mode {
-                            0b000000 => {
+                            0b0000000 => {
                                 // SRLIW: Shift-right logical immediate
                                 self.set_register(inst.rd, (rs1 >> shamt) as i32 as i64 as u64);
                             },
-                            0b010000 => {
+                            0b0100000 => {
                                 // SRAIW: Shift-right arith immediate
                                 self.set_register(inst.rd, ((rs1 as i32) >> shamt) as i64 as u64);
                             },
@@ -646,7 +659,7 @@ impl From<u32> for Jtype {
     // Convert the instruction into an immediate / register combo
     fn from(inst: u32) -> Self {
 
-        let imm20   = (inst >> 30) & 0b1;
+        let imm20   = (inst >> 31) & 0b1;
         let imm101  = (inst >> 21) & 0b1111111111;
         let imm11   = (inst >> 20) & 0b1;
         let imm1912 = (inst >> 12) & 0b11111111;

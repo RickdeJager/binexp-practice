@@ -127,6 +127,9 @@ impl Mmu {
             // Restore the memory and permissions
             self.memory[start..end].copy_from_slice(&other.memory[start..end]);
             self.permissions[start..end].copy_from_slice(&other.permissions[start..end]);
+
+            // Restore allocator state
+            self.cur_alloc = other.cur_alloc;
         }
 
         // Clear the old dirty list
@@ -135,9 +138,6 @@ impl Mmu {
 
     /// Allocate a region of memory as RW.
     pub fn allocate(&mut self, size: usize) -> Option<VirtAddr> {
-
-        // 16-byte align the allocation
-        let aligned_size = (size + 0xf) & !0xf;
 
         // Get the current allocation base
         let base = self.cur_alloc;
@@ -148,7 +148,7 @@ impl Mmu {
         }
 
         // Update the allocation size (check for overflow)
-        self.cur_alloc = VirtAddr(self.cur_alloc.0.checked_add(aligned_size)?);
+        self.cur_alloc = VirtAddr(self.cur_alloc.0.checked_add(size)?);
 
         // Allocation would go out of memory, failed to alloc
         if self.cur_alloc.0 > self.memory.len() {

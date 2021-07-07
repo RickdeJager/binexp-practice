@@ -1,6 +1,4 @@
-use std::path::Path;
-
-use crate::mmu::{Mmu, Perm, VirtAddr, PERM_WRITE};
+use crate::mmu::{Mmu, VirtAddr};
 use crate::riscv;
 
 #[repr(u8)]
