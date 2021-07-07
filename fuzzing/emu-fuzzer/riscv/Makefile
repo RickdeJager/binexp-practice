@@ -1,7 +1,9 @@
 # We need to be able to overwrite this with our cross-compiler
 CC ?= gcc
 
-all: minimal hello_world shift echo-argv
+VULN_DIR = ../../../vulnerable_programs
+
+all: minimal hello_world shift echo-argv text-file-parser
 
 minimal: minimal.c
 	${CC} minimal.c -o minimal
@@ -15,9 +17,13 @@ echo-argv: echo-argv.c
 shift: shift.c
 	${CC} shift.c -o shift
 
+text-file-parser: ${VULN_DIR}/text_file_parser/vuln.c
+	${CC} ${VULN_DIR}/text_file_parser/vuln.c -o text-file-parser
+
 .PHONY: clean
 clean:
 	rm -f minimal
 	rm -f hello_world
 	rm -f shift
 	rm -f echo-argv
+	rm -f text-file-parser

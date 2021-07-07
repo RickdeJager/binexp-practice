@@ -41,12 +41,21 @@ int get_line_length(FILE * fp) {
     return num_lines;                                                                               
 }                                                                                                   
 
+int get_command(char * buf, char * command) {
+    FILE * cmd = popen(command, "r");
+    if (cmd) {
+        if (fgets(buf, MAX_LINE_LEN, cmd))
+            return 1;
+    }
+    return 0;
+}
+                                                                                                    
 int main(int argc, char** argv) { 
     char buf [MAX_LINE_LEN];
   
     if (argc != 2) {
         print_usage();
-        return 1;
+        return -1;
     }
 
     FILE * fp = fopen(argv[1],"r");
@@ -57,8 +66,13 @@ int main(int argc, char** argv) {
     int num_lines = 0;
     int err = get_num_lines(fp, &num_lines);
     if (err) {
-        return 1;
+        return -1;
     }
+
+    // Yes, I realise how cheesy this is.
+    printf("Starting parser at: ");
+    if (get_command(buf, "date"))
+        puts(buf);
 
     printf("File contains %d lines.\n",num_lines);
     for (int i = 0; i < num_lines; i++) {

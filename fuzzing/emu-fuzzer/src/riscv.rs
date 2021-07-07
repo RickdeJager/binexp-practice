@@ -5,6 +5,7 @@ use crate::mmu::{Mmu, Perm, VirtAddr};
 use crate::mmu::{PERM_READ, PERM_EXEC};
 
 use crate::syscall;
+use crate::files::FilePool;
 
 use std::convert::TryFrom;
 
@@ -98,13 +99,19 @@ pub struct RiscV {
 
     /// Memory obj
     memory: Mmu,
+
+    /// FilePool
+    // TODO; Not super comfortable with having the filepool be a member of a specific Arch
+    // struct. Move to emu if ownership allows for it.
+    filePool: FilePool,
 }
 
 impl PreArch for RiscV {
-    fn new(mmu: Mmu) -> Box<dyn Arch + Send + Sync> {
+    fn new(mmu: Mmu, filePool: FilePool) -> Box<dyn Arch + Send + Sync> {
         Box::new(RiscV {
             registers: [0u64; NUM_REGISTERS],
-            memory: mmu,
+            memory   : mmu,
+            filePool : filePool,
         })
     }
 }
@@ -128,7 +135,7 @@ impl RiscV {
 
     /// Translate RiscV syscall numbers into the proper syscall handler,
     /// and arguments / return values.
-    fn handle_syscall(&mut self) -> Result<i64, VmExit> {
+    fn handle_syscall(&mut self) -> Result<(), VmExit> {
         let nr_syscall = self.get_register(Register::A7);
 
         let a0 = self.get_register(Register::A0);
@@ -136,14 +143,35 @@ impl RiscV {
         let a2 = self.get_register(Register::A2);
 
         return match nr_syscall {
-            64  => {
-                syscall::write(&self.memory, a0 as i64, VirtAddr(a1 as usize), a2)
+            // close
+            57 => {
+                let ret = syscall::close(a0 as i64)?;
+                self.set_register(Register::A0, ret as u64);
+                Ok(())
             },
-            93  => syscall::sys_exit(a0),
-            94  => syscall::sys_exit(a0),
+            // write
+            64  => {
+                let ret = syscall::write(&self.memory, a0 as i64, VirtAddr(a1 as usize), a2)?;
+                self.set_register(Register::A0, ret as u64);
+                Ok(())
+            },
+            // fstat
+            80  => {
+                let ret: i64 = syscall::fstat(&mut self.memory, &self.filePool,
+                                              a0 as i64, VirtAddr(a1 as usize))?;
+                self.set_register(Register::A0, ret as u64);
+                Ok(())
+            },
+            // exit
+            93  => {syscall::exit(a0 as i64)?; Ok(())},
+            // exit_group
+            94  => {syscall::exit(a0 as i64)?; Ok(())},
+            // brk
             214 => {
                 let increment = self.get_register(Register::A0) as i64;
-                syscall::sbrk(&mut self.memory, increment)
+                let ret = syscall::sbrk(&mut self.memory, increment)?;
+                self.set_register(Register::A0, ret as u64);
+                Ok(())
             },
              _ => Err(VmExit::SyscallNotImplemented(nr_syscall)),
         }
@@ -190,6 +218,7 @@ impl Arch for RiscV {
             registers: <[u64; NUM_REGISTERS]>::try_from(
                            self.get_register_state().clone()).unwrap(),
             memory: self.memory.fork(),
+            filePool: self.filePool.clone()
         })
     }
 
@@ -202,7 +231,7 @@ impl Arch for RiscV {
 
         let opcode = inst & 0b1111111;
         //DEBUG
-      //  print!("Opcode: {:07b} PC: {:x?}\n", opcode, pc);
+        print!("Opcode: {:07b} PC: {:x?}\n", opcode, pc);
 
         match opcode {
             0b0110111 => {

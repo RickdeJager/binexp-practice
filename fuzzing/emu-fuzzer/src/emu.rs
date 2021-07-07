@@ -1,5 +1,6 @@
 use crate::mmu::{Mmu, VirtAddr};
 use crate::riscv;
+use crate::files::FilePool;
 
 #[repr(u8)]
 pub enum Archs {
@@ -7,7 +8,7 @@ pub enum Archs {
 }
 
 pub trait PreArch: Arch {
-    fn new(mem: Mmu) -> Box<dyn Arch + Send + Sync>;
+    fn new(mmu: Mmu, filePool: FilePool) -> Box<dyn Arch + Send + Sync>;
 }
 
 pub trait Arch {
@@ -28,7 +29,7 @@ pub trait Arch {
 pub enum VmExit {
 
     /// Clean exit, as requested by the Guest.
-    Exit(u64),
+    Exit(i64),
 
     /// Calling this Syscall would trigger an integer overflow.
     SyscallIntegerOverflow,
@@ -45,8 +46,12 @@ pub enum VmExit {
     /// The Address overflowed while reading/writing.
     AddressIntegerOverflow,
 
-    /// Requested memomry is out of bounds.
+    /// Requested memory is out of bounds.
     AddressMiss(VirtAddr, usize),
+
+    /// The VM hit an error during a subroutine, error is not 
+    /// necessarily caused by the program.
+    Meta,
 }
 
 pub struct Emulator {
@@ -56,48 +61,48 @@ pub struct Emulator {
 
 impl Emulator {
     // Create a new emulator, using a predefined block of memory and a stack size.
-    pub fn new(chosen_arch: Archs, mem: Mmu) -> Self {
+    pub fn new(chosen_arch: Archs, mem: Mmu, filePool: FilePool) -> Self {
         match chosen_arch {
             Archs::RiscV => {
                 Emulator{
-                    arch: riscv::RiscV::new(mem)
+                    arch: riscv::RiscV::new(mem, filePool),
                 }
             },
         }
     }
 
-    // TODO; Figure out the proper way to do this, (more general)
+    /// Fork the current emulator.
     pub fn fork(&self) -> Self {
         Emulator {
-            arch: self.arch.fork()
+            arch: self.arch.fork(),
         }
     }
 
-    // TODO; Figure out the proper way to do this, (more general)
+    /// Differentially reset the emulator to a previous state.
+    /// Assumes `other` is actually an earlier version of `self`.
     pub fn reset(&mut self, other: &Self) {
         self.arch.set_register_state(other.arch.get_register_state());
     }
 
-
+    /// Set the entry point of the emulator.
     pub fn set_entry(&mut self, entry: u64) {
         self.arch.set_entry(entry);
     }
 
+    /// Set the stack pointer.
     pub fn set_stackp(&mut self, stackp: u64) {
         self.arch.set_stackp(stackp);
     }
 
-    pub fn run(&mut self) {
-        let exit = loop {
-            if let Err(exit)  = self.arch.tick(){
+    /// Run the emulator until it either crashes or exits.
+    pub fn run(&mut self) -> VmExit {
+        loop {
+            if let Err(exit) = self.arch.tick(){
+        //        DEBUG
+        //        println!("VM exited due to: {:?}", exit);
                 break exit;
             }
-        };
-
-        //        DEBUG
-//        println!("VM exited due to: {:?}", exit);
+        }
     }
 }
-
-
 
