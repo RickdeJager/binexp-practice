@@ -7,11 +7,11 @@ pub enum Archs {
 }
 
 pub trait PreArch: Arch {
-    fn new(mem: Mmu) -> Box<Self>;
-    fn fork(old_arch: &dyn Arch) -> Box<Self>;
+    fn new(mem: Mmu) -> Box<dyn Arch + Send + Sync>;
 }
 
 pub trait Arch {
+
     fn tick(&mut self) -> Result<(), VmExit>;
     fn get_register_raw(&self, reg: usize) -> Option<u64>;
     fn set_register_raw(&mut self, reg: usize, value: u64) -> Option<()>;
@@ -21,7 +21,7 @@ pub trait Arch {
     fn get_register_state(&self) -> &[u64];
     fn set_register_state(&mut self, new_regs: &[u64]) -> Option<()>;
 
-    fn fork_memory(&self) -> Mmu;
+    fn fork(&self) -> Box<dyn Arch + Send + Sync>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -51,7 +51,7 @@ pub enum VmExit {
 
 pub struct Emulator {
     /// The architecture struct that this emu will exec.
-    pub arch:   Box<dyn Arch>,
+    pub arch: Box<dyn Arch + Send + Sync>,
 }
 
 impl Emulator {
@@ -65,6 +65,19 @@ impl Emulator {
             },
         }
     }
+
+    // TODO; Figure out the proper way to do this, (more general)
+    pub fn fork(&self) -> Self {
+        Emulator {
+            arch: self.arch.fork()
+        }
+    }
+
+    // TODO; Figure out the proper way to do this, (more general)
+    pub fn reset(&mut self, other: &Self) {
+        self.arch.set_register_state(other.arch.get_register_state());
+    }
+
 
     pub fn set_entry(&mut self, entry: u64) {
         self.arch.set_entry(entry);
@@ -81,7 +94,8 @@ impl Emulator {
             }
         };
 
-        println!("VM exited due to: {:?}", exit);
+        //        DEBUG
+//        println!("VM exited due to: {:?}", exit);
     }
 }
 

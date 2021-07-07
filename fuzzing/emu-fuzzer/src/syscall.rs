@@ -17,7 +17,7 @@ pub fn write(mmu: &Mmu, fd: i64, p_buf: VirtAddr, count: u64) -> Result<i64, VmE
 
     // print to stdin / stdout / stderr
     if fd == 0 || fd == 1 || fd == 2 {
-        if !crate::ALLOW_GUEST_PRINT {
+        if crate::ALLOW_GUEST_PRINT {
             // TODO; This is not accurate, we should also be printing unprintable chars
             print!("{}", String::from_utf8_lossy(&tmp));
         }

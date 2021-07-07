@@ -101,18 +101,10 @@ pub struct RiscV {
 }
 
 impl PreArch for RiscV {
-    fn new(mmu: Mmu) -> Box<Self> {
+    fn new(mmu: Mmu) -> Box<dyn Arch + Send + Sync> {
         Box::new(RiscV {
             registers: [0u64; NUM_REGISTERS],
             memory: mmu,
-        })
-    }
-
-    fn fork(old_arch: &dyn Arch) -> Box<Self> {
-        Box::new(RiscV {
-            registers: <[u64; NUM_REGISTERS]>::try_from(
-                           old_arch.get_register_state().clone()).unwrap(),
-            memory: old_arch.fork_memory(),
         })
     }
 }
@@ -193,8 +185,12 @@ impl Arch for RiscV {
         Some(())
     }
 
-    fn fork_memory(&self) -> Mmu {
-        self.memory.fork()
+    fn fork(&self) -> Box<dyn Arch + Send + Sync> {
+        Box::new(RiscV {
+            registers: <[u64; NUM_REGISTERS]>::try_from(
+                           self.get_register_state().clone()).unwrap(),
+            memory: self.memory.fork(),
+        })
     }
 
     fn tick(&mut self) -> Result<(), VmExit> {

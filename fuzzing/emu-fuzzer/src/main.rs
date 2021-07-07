@@ -10,7 +10,24 @@ use mmu::{Mmu, Perm, VirtAddr};
 use mmu::{PERM_WRITE, PERM_READ, PERM_EXEC};
 use emu::{Emulator, Archs};
 
+use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+
 pub const ALLOW_GUEST_PRINT: bool = false;
+
+const BATCH_SIZE: usize = 1000;
+const NUM_THREADS: usize = 1;
+
+#[derive(Default)]
+struct Stats {
+    // Total number of fuzz cases performed
+    fuzz_cases: AtomicUsize,
+
+    // Total number of crashes
+    crashes: AtomicUsize
+}
 
 
 /// Load an elf, return the entry point on success.
@@ -109,14 +126,50 @@ fn main() {
     }
     push_i!(argv.len() as u64); // ARGC
 
-    let mut emu = Emulator::new(Archs::RiscV, memory.fork());
+    let mut golden_emu = Emulator::new(Archs::RiscV, memory.fork());
 
     // Set the emu's entry point
-    emu.set_entry(entryp);
+    golden_emu.set_entry(entryp);
     // Set the emu's stack pointer to point to our newly created stack pointer
-    emu.set_stackp(stack.0 as u64);
-
-    emu.run();
+    golden_emu.set_stackp(stack.0 as u64);
 
 
+    // Keep track of all threads
+    let mut threads = Vec::new();
+
+    // create a stats object
+    let stats      = Arc::new(Stats::default());
+    let golden_emu = Arc::new(golden_emu);
+
+    for thread_id in 0..NUM_THREADS {
+        let stats = stats.clone();
+        let golden_emu = golden_emu.clone();
+        // Spawn a new thread
+        threads.push(std::thread::spawn(move || worker(golden_emu, thread_id, stats)));
+    }
+
+    // Start a timer
+    let start = Instant::now();
+
+    loop {
+        std::thread::sleep(Duration::from_millis(1000));
+
+        let elapsed = start.elapsed().as_secs_f64();
+        let cases = stats.fuzz_cases.load(Ordering::SeqCst);
+        let crashes = stats.crashes.load(Ordering::SeqCst);
+        print!("[{:10.3}] Cases {:10} | FCpS {:10.2} | Crashes {:10}\n", 
+               elapsed, cases, cases as f64 / elapsed, crashes);
+    }
+}
+
+fn worker(golden_emu: Arc<Emulator>, _thread_id: usize, stats: Arc<Stats>) {
+    let mut emu: Emulator = golden_emu.fork();
+    loop {
+        for _ in 0..BATCH_SIZE {
+            emu.run();
+            emu.reset(&golden_emu);
+        }
+        // Update the statistics after completing a batch
+        stats.fuzz_cases.fetch_add(BATCH_SIZE, Ordering::SeqCst);
+    }
 }
