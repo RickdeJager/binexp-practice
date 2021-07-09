@@ -6,6 +6,7 @@ use crate::mmu::{PERM_READ, PERM_EXEC};
 
 use crate::syscall;
 use crate::files::FilePool;
+use crate::util;
 
 use std::convert::TryFrom;
 
@@ -138,6 +139,9 @@ impl RiscV {
     fn handle_syscall(&mut self) -> Result<(), VmExit> {
         let nr_syscall = self.get_register(Register::A7);
 
+        //DEBUG
+        println!("SYSCALL: {}", nr_syscall);
+
         let a0 = self.get_register(Register::A0);
         let a1 = self.get_register(Register::A1);
         let a2 = self.get_register(Register::A2);
@@ -168,8 +172,18 @@ impl RiscV {
             94  => {syscall::exit(a0 as i64)?; Ok(())},
             // brk
             214 => {
-                let increment = self.get_register(Register::A0) as i64;
-                let ret = syscall::sbrk(&mut self.memory, increment)?;
+                let size = self.get_register(Register::A0) as i64;
+                print!("BRK: {:x?}", size);
+                let ret = syscall::brk(&mut self.memory, size)?;
+                print!(" = {:x?}\n", ret);
+                self.set_register(Register::A0, ret as u64);
+                Ok(())
+            },
+            // open
+            1024 => {
+                // Get the pathname as a c string.
+                let path = util::get_c_string(&self.memory, VirtAddr(a0 as usize))?;
+                let ret = syscall::open(&mut self.filePool, &path, a1 as i64)?;
                 self.set_register(Register::A0, ret as u64);
                 Ok(())
             },
@@ -231,7 +245,7 @@ impl Arch for RiscV {
 
         let opcode = inst & 0b1111111;
         //DEBUG
-        print!("Opcode: {:07b} PC: {:x?}\n", opcode, pc);
+        //print!("Opcode: {:07b} PC: {:x?}\n", opcode, pc);
 
         match opcode {
             0b0110111 => {

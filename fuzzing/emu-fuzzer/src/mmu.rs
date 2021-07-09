@@ -86,17 +86,21 @@ pub struct Mmu {
 
     /// Current base address of the next allocation to perform
     pub cur_alloc: VirtAddr,
+
+    /// The lowest address in the allocated stack.
+    pub stack_location: VirtAddr,
 }
 
 impl Mmu {
     /// Create a new memory space of size `size`
     pub fn new(size: usize) -> Self {
         Mmu {
-            memory      : vec![0; size],
-            permissions : vec![Perm(0); size],
-            dirty       : Vec::with_capacity(size / DIRTY_BLOCK_SIZE + 1),
-            dirty_bitmap: vec![0u64; size / DIRTY_BLOCK_SIZE / 64 + 1],
-            cur_alloc   : VirtAddr(0x10000),
+            memory        : vec![0; size],
+            permissions   : vec![Perm(0); size],
+            dirty         : Vec::with_capacity(size / DIRTY_BLOCK_SIZE + 1),
+            dirty_bitmap  : vec![0u64; size / DIRTY_BLOCK_SIZE / 64 + 1],
+            cur_alloc     : VirtAddr(0x10000),
+            stack_location: VirtAddr(0),
         }
     }
 
@@ -105,12 +109,13 @@ impl Mmu {
         let size = self.memory.len();
 
         Mmu {
-            memory      : self.memory.clone(),
-            permissions : self.permissions.clone(),
+            memory        : self.memory.clone(),
+            permissions   : self.permissions.clone(),
             // Keep the dirty bits clear.                          
-            dirty       : Vec::with_capacity(size / DIRTY_BLOCK_SIZE + 1),
-            dirty_bitmap: vec![0u64; size / DIRTY_BLOCK_SIZE / 64 + 1],
-            cur_alloc   : self.cur_alloc.clone(),
+            dirty         : Vec::with_capacity(size / DIRTY_BLOCK_SIZE + 1),
+            dirty_bitmap  : vec![0u64; size / DIRTY_BLOCK_SIZE / 64 + 1],
+            cur_alloc     : self.cur_alloc.clone(),
+            stack_location: self.stack_location.clone(),
         }
     }
 
@@ -142,16 +147,16 @@ impl Mmu {
         // Get the current allocation base
         let base = self.cur_alloc;
 
-        // We can't allocate if base exceeds memory length
+/*        // We can't allocate if base exceeds the stack
         if base.0 >= self.memory.len() {
             return None;
-        }
+        }*/
 
         // Update the allocation size (check for overflow)
         self.cur_alloc = VirtAddr(self.cur_alloc.0.checked_add(size)?);
 
         // Allocation would go out of memory, failed to alloc
-        if self.cur_alloc.0 > self.memory.len() {
+        if self.cur_alloc.0 > self.stack_location.0 {
             return None;
         }
 
@@ -159,6 +164,25 @@ impl Mmu {
         self.set_permissions(base, size, Perm(PERM_RAW | PERM_WRITE));
 
         Some(base)
+    }
+
+    /// Manually allocate a stack at the end of the memory block
+    /// Returns a pointer to the end of the newly allocated stack.
+    pub fn allocate_stack(&mut self, size: usize) -> Option<VirtAddr> {
+        // Make sure the stack fits
+        if self.cur_alloc.0.checked_add(size)? > self.memory.len() {
+            return None;
+        }
+
+        let base = VirtAddr(self.memory.len() - size);
+
+        // Mark the new memory as uninitialized and writable.
+        self.set_permissions(base, size, Perm(PERM_RAW | PERM_WRITE));
+
+        // Save the bottom of the stack
+        self.stack_location = base;
+
+        Some(VirtAddr(base.0 + size))
     }
 
     /// Apply permissions to a region of memory, denoted by offset, len

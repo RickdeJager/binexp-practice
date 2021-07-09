@@ -40,10 +40,8 @@ fn main() {
     let mut memory = Mmu::new(mmu_size);
     let entryp = load_elf(binary_path, &mut memory).expect("Failed to parse ELF.");
     // Create a stack
-    let mut stack = memory.allocate(stack_size).expect("Failed to allocate stack.");
+    let mut stack = memory.allocate_stack(stack_size).expect("Failed to allocate stack.");
 
-    // Set the initial stack pointer to the end of the stack.
-    stack.0 += stack_size;
 
     /// Push an integer onto the stack
     macro_rules! push_i {
@@ -59,6 +57,8 @@ fn main() {
     push_i!(0u64); // AUXP
     push_i!(0u64); // ENVP
     push_i!(0u64); // ARGV-end
+
+    // Create argv from a vec.
     for &item in argv.iter().rev() {
         let tmp = item.as_bytes();
         // Some functions like strlen, will batch read values, so we need to pad to the
