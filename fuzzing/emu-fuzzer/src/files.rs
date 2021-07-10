@@ -1,8 +1,14 @@
 /// Handles all virtual files on the system. Each Emulator will get its own dedicated FilePool
 /// struct that holds files from the corpus.
 
+//use std::rc::Rc;
+use std::sync::Arc;
 use std::collections::HashMap;
 
+
+pub const SEEK_SET: i32 = 0;
+pub const SEEK_CUR: i32 = 1;
+pub const SEEK_END: i32 = 2;
 
 #[derive(Default, Debug, Clone)]
 struct Stat {
@@ -116,7 +122,7 @@ struct Fd {
     /// TODO; PERMS
 
     /// The actual file we're pointing to. (None in case of stdin/stdout)
-    filename: Option<String>,
+    file: Arc<File>,
 
     /// Offset into the file
     offset: usize,
@@ -127,8 +133,14 @@ impl Fd {
     /// Read n bytes at the current offset. Return a reference to them
     /// Update the offset after reading
     pub fn read(&mut self, amount: usize) -> &[u8] {
-        if let Some(file_name) = self.open_fds[fd].filename.as_ref() {
-            return Some(self.file_map.get(file_name)?.stat.to_raw_bytes());
+        if self.offset >= self.file.contents.len() {
+            return &[];
+        } else {
+            let start = self.offset;
+            let end = std::cmp::min(self.file.contents.len() - self.offset, amount);
+            // Move the FD forward
+            self.offset = end;
+            return &self.file.contents[start..end];
         }
     }
 }
@@ -136,7 +148,7 @@ impl Fd {
 #[derive(Clone)]
 pub struct FilePool {
     /// A Hashmap of all files available within this FilePool.
-    file_map: HashMap<String, File>,
+    file_map: HashMap<String, Arc<File>>,
 
     /// Vec of all currently opened FD's
     open_fds:  Vec<Fd>,
@@ -152,16 +164,21 @@ impl FilePool {
         };
         // Add dummy Fd's for stdin / stdout / stderr
         for filename in ["STDIN", "STDOUT", "STDERR"].iter() {
-            // Add a dummy fd
-            fp.open_fds.push(Fd{filename: Some(filename.to_string()),  offset: 0});
+    
             // Add empty backing files
-            fp.file_map.insert(filename.to_string(), File {
+            let file = Arc::new(File {
                 contents: vec![0],
                 tweak:    HashMap::new(),
                 stat:     Stat::new(),
             });
-        }
 
+            // Add the file to the filemap and open an FD
+            fp.open_fds.push(Fd{
+                file: file.clone(),
+                offset: 0,
+            });
+            fp.file_map.insert(filename.to_string(), file);
+        }
         fp
     }
 
@@ -175,42 +192,89 @@ impl FilePool {
         file_stat.st_blocks = (contents.len() as i64 + 511) / 512;
         // Set some defaults
 
-        let file = File {
+        let file = Arc::new(File {
             stat    : file_stat,
             contents: contents, 
             tweak   : HashMap::new(), 
-        };
+        });
         self.file_map.insert(filename.to_string(), file);
 
         Some(())
     }
 
+    /// Dump a file from the filePool. Intended to be used by the fuzzer to get
+    /// crashing outputs. Emulators should use Fd's instead.
+    pub fn dump(&self, filepath: &str) -> Option<Vec<u8>> {
+        let file_ref = self.file_map.get(filepath)?;
+        Some((*file_ref).clone().contents.to_vec())
+    }
+
     /// Assign an Fd to a file in the file pool
     pub fn open(&mut self, filepath: &str) -> Option<usize> {
         // Attempt to get the file from our file map
-        if !self.file_map.contains_key(filepath) {
-            return None;
+        match self.file_map.get(filepath) {
+            Some(file_rc) => {
+                // Push an Fd into the filePool, return its index.
+                self.open_fds.push(Fd{
+                    file  : file_rc.clone(),
+                    offset: 0,
+                });
+                Some(self.open_fds.len()-1)
+            },
+            None => None,
         }
-        
-        // Push an Fd into the filePool, return its index.
-        self.open_fds.push(Fd{
-            filename  : Some(filepath.to_string()),
-            offset    : 0,
-        });
-        Some(self.open_fds.len()-1)
     }
 
     /// Stat an Fd
-    pub fn fstat(&self, fd: usize) -> Option<&[u8]> {
+    pub fn fstat(&self, fd: usize) ->  Option<&[u8]> {
         // No clue what this FD is, you get a None, enjoy.
         if fd >= self.open_fds.len() {
             return None;
         }
-
-        if let Some(file_name) = self.open_fds[fd].filename.as_ref() {
-            return Some(self.file_map.get(file_name)?.stat.to_raw_bytes());
-        }
-
-        None
+        Some(self.open_fds[fd].file.stat.to_raw_bytes())
     }
+
+    /// Read from an FD
+    pub fn read(&mut self, fd: usize, size: usize) -> Option<&[u8]> {
+        // No clue what this FD is, you get a None, enjoy.
+        if fd >= self.open_fds.len() {
+            return None;
+        }
+        Some(self.open_fds[fd].read(size))
+    }
+
+    /// lseek an FD
+    /*
+       Upon successful completion, lseek() returns the resulting offset  loca‐
+       tion  as  measured  in bytes from the beginning of the file.  On error,
+       the value (off_t) -1 is returned and errno is set to indicate  the  er‐
+       ror.
+       */
+    pub fn lseek(&mut self, fd: usize, offset: i64, whence: i32) -> Option<i64> {
+        // No clue what this FD is, you get a None, enjoy.
+        if fd >= self.open_fds.len() {
+            return None;
+        }
+        match whence {
+            SEEK_SET => {
+                // TODO; This is not accurate, must rewrite Fds a little to allow for negative
+                // file offsets.
+                self.open_fds[fd].offset = std::cmp::max(0, offset) as usize;
+                Some(offset)
+            },
+            SEEK_CUR => {
+                self.open_fds[fd].offset = (self.open_fds[fd].offset as i64 + offset) as usize;
+                Some(self.open_fds[fd].offset as i64)
+            },
+            SEEK_END => {
+                self.open_fds[fd].offset = (self.open_fds[fd].file.contents.len() as i64 + offset)
+                    as usize;
+                Some(self.open_fds[fd].offset as i64)
+            },
+
+            _ => Some(-1),
+        }
+    }
+
+
 }

@@ -10,7 +10,7 @@ pub const PERM_RAW  : u8 = 1 << 3;
 /// perf for your specific target.
 /// Setting this to a larger value causes fewer, large memcpy's to occur, setting
 /// this to a lower value causes more, smaller memcpy's to occur.
-const DIRTY_BLOCK_SIZE: usize = 4096;
+const DIRTY_BLOCK_SIZE: usize = 512;
 
 /// Small little helper macro to get type lengths at compile time
 macro_rules! get_type_len {
@@ -147,11 +147,6 @@ impl Mmu {
         // Get the current allocation base
         let base = self.cur_alloc;
 
-/*        // We can't allocate if base exceeds the stack
-        if base.0 >= self.memory.len() {
-            return None;
-        }*/
-
         // Update the allocation size (check for overflow)
         self.cur_alloc = VirtAddr(self.cur_alloc.0.checked_add(size)?);
 
@@ -162,6 +157,7 @@ impl Mmu {
 
         // Mark the new memory as uninitialized and writable.
         self.set_permissions(base, size, Perm(PERM_RAW | PERM_WRITE));
+        //self.set_permissions(base, size, Perm(PERM_READ | PERM_WRITE));
 
         Some(base)
     }
@@ -169,6 +165,9 @@ impl Mmu {
     /// Manually allocate a stack at the end of the memory block
     /// Returns a pointer to the end of the newly allocated stack.
     pub fn allocate_stack(&mut self, size: usize) -> Option<VirtAddr> {
+        // We assumed the stack is aligned earlier, so let's assert that.
+        assert!(size & 0xf == 0x00, "stack alloc unaligned.");
+
         // Make sure the stack fits
         if self.cur_alloc.0.checked_add(size)? > self.memory.len() {
             return None;
@@ -177,7 +176,9 @@ impl Mmu {
         let base = VirtAddr(self.memory.len() - size);
 
         // Mark the new memory as uninitialized and writable.
-        self.set_permissions(base, size, Perm(PERM_RAW | PERM_WRITE));
+        // TODO;
+        //self.set_permissions(base, size, Perm(PERM_RAW | PERM_WRITE));
+        self.set_permissions(base, size, Perm(PERM_READ | PERM_WRITE));
 
         // Save the bottom of the stack
         self.stack_location = base;
@@ -246,7 +247,7 @@ impl Mmu {
             perms
                 .iter_mut()
                 .filter(|x| (x.0 & PERM_RAW) != 0)
-                .for_each(|x| {*x = Perm(x.0 | PERM_READ)});
+                .for_each(|x| {*x = Perm((x.0 | PERM_READ) & !PERM_RAW)});
         }
         Ok(())
     }

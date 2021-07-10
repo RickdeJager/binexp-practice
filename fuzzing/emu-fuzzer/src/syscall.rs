@@ -6,7 +6,6 @@
 
 // https://sourceware.org/newlib/libc.html#Syscalls
 
-use crate::util;
 use crate::emu::VmExit;
 use crate::mmu::{Mmu, VirtAddr};
 use crate::files::FilePool;
@@ -25,9 +24,6 @@ pub fn close(_fd: i64) -> Result<i64, VmExit> {
 /// Stat a file discriptor, write the result into p_statbuf
 pub fn fstat(mmu: &mut Mmu, file_pool: &FilePool, fd: i64, p_statbuf: VirtAddr) 
         -> Result<i64, VmExit> {
-    //DEBUG
-    println!("   [DEBUG] Guest fstatted:  {:?}" , fd);
-    println!("   [DEBUG] Write result to: {:x?}", p_statbuf);
 
     match file_pool.fstat(fd as usize) {
         Some(data) => {
@@ -82,14 +78,23 @@ pub fn open(fp: &mut FilePool, filepath: &str, flags: i64) -> Result<i64, VmExit
     }
 }
 
-pub fn read(fp: &FilePool, mmu: &mut Mmu, fd: i64, p_buf: VirtAddr, 
-            usize count) -> Result<i64, VmExit> {
-
-
-    let tmp = vec![1];
-    mmu.write_from(p_buf, &tmp)?;
-
-    Ok(tmp.len() as i64)
-
-
+pub fn read(fp: &mut FilePool, mmu: &mut Mmu, fd: i64, p_buf: VirtAddr, 
+            count: usize) -> Result<i64, VmExit> {
+    
+    match fp.read(fd as usize, count) {
+        Some(data) => {
+            mmu.write_from(p_buf, data)?;
+            Ok(data.len() as i64)
+        },
+        None => Ok(-1)
+    }
 }
+
+
+pub fn lseek(fp: &mut FilePool, fd: i64, offset: i64, whence: i32) -> Result<i64, VmExit> {
+    match fp.lseek(fd as usize, offset, whence) {
+        Some(num) => Ok(num),
+        None => Ok(-1),
+    }
+}
+

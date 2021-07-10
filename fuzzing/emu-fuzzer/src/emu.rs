@@ -23,6 +23,9 @@ pub trait Arch {
     fn set_register_state(&mut self, new_regs: &[u64]) -> Option<()>;
 
     fn fork(&self) -> Box<dyn Arch + Send + Sync>;
+    fn reset_mem(&mut self, other_mem: &Mmu);
+    fn get_mem_ref(&self) -> &Mmu;
+    fn get_filepool_ref(&self) -> &FilePool;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -82,6 +85,7 @@ impl Emulator {
     /// Assumes `other` is actually an earlier version of `self`.
     pub fn reset(&mut self, other: &Self) {
         self.arch.set_register_state(other.arch.get_register_state());
+        self.arch.reset_mem(other.arch.get_mem_ref());
     }
 
     /// Set the entry point of the emulator.
@@ -95,14 +99,13 @@ impl Emulator {
     }
 
     /// Run the emulator until it either crashes or exits.
-    pub fn run(&mut self) -> VmExit {
-        loop {
+    pub fn run(&mut self) -> (usize, VmExit) {
+        for count in 0.. {
             if let Err(exit) = self.arch.tick(){
-        //        DEBUG
-        //        println!("VM exited due to: {:?}", exit);
-                break exit;
+                return (count, exit);
             }
         }
+        unreachable!();
     }
 }
 

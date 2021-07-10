@@ -140,7 +140,7 @@ impl RiscV {
         let nr_syscall = self.get_register(Register::A7);
 
         //DEBUG
-        println!("SYSCALL: {}", nr_syscall);
+        //println!("SYSCALL: {}", nr_syscall);
 
         let a0 = self.get_register(Register::A0);
         let a1 = self.get_register(Register::A1);
@@ -150,6 +150,19 @@ impl RiscV {
             // close
             57 => {
                 let ret = syscall::close(a0 as i64)?;
+                self.set_register(Register::A0, ret as u64);
+                Ok(())
+            },
+            // lseek
+            62  => {
+                let ret = syscall::lseek(&mut self.filePool, a0 as i64, a1 as i64, a2 as i32)?;
+                self.set_register(Register::A0, ret as u64);
+                Ok(())
+            },
+            // read
+            63  => {
+                let ret = syscall::read(&mut self.filePool, &mut self.memory, 
+                                        a0 as i64, VirtAddr(a1 as usize), a2 as usize)?;
                 self.set_register(Register::A0, ret as u64);
                 Ok(())
             },
@@ -173,9 +186,7 @@ impl RiscV {
             // brk
             214 => {
                 let size = self.get_register(Register::A0) as i64;
-                print!("BRK: {:x?}", size);
                 let ret = syscall::brk(&mut self.memory, size)?;
-                print!(" = {:x?}\n", ret);
                 self.set_register(Register::A0, ret as u64);
                 Ok(())
             },
@@ -235,6 +246,19 @@ impl Arch for RiscV {
             filePool: self.filePool.clone()
         })
     }
+
+    fn reset_mem(&mut self, other_mem: &Mmu) {
+        self.memory.reset(other_mem);
+    }
+
+    fn get_mem_ref(&self) -> &Mmu {
+        &self.memory
+    }
+
+    fn get_filepool_ref(&self) -> &FilePool {
+        &self.filePool
+    }
+
 
     fn tick(&mut self) -> Result<(), VmExit> {
         // Fetch the current PC.
@@ -538,7 +562,7 @@ impl Arch for RiscV {
                             self.set_register(inst.rd, 0);
                         }
                     },
-                    (0b0100000, 0b100) => {
+                    (0b0000000, 0b100) => {
                         // XOR: Xor two registers
                         self.set_register(inst.rd, rs1 ^ rs2);
                     },
