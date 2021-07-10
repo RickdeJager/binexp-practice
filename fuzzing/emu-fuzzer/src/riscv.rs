@@ -263,7 +263,7 @@ impl Arch for RiscV {
         &self.filePool
     }
 
-    fn apply_tweak(&self, filepath: &str, tweak: Vec<(usize, u8)>) -> Option<()> {
+    fn apply_tweak(&mut self, filepath: &str, tweak: Vec<(usize, u8)>) -> Option<()> {
         self.filePool.apply_tweak(filepath, tweak)
     }
 

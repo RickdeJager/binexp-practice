@@ -28,7 +28,7 @@ pub trait Arch {
     fn get_mem_ref(&self) -> &Mmu;
     fn get_filepool_ref(&self) -> &FilePool;
 
-    fn apply_tweak(&self, filepath: &str, tweak: Vec<(usize, u8)>) -> Option<()>;
+    fn apply_tweak(&mut self, filepath: &str, tweak: Vec<(usize, u8)>) -> Option<()>;
 }
 
 #[derive(Clone, Copy, Debug)]

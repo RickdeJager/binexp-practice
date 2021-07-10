@@ -25,8 +25,8 @@ pub const CRASHES_DIR: &str = "./crashes";
 pub const CORPUS_DIR : &str = "./corpus";
 pub const TEST_FILE : &str = "testfile";
 
-const BATCH_SIZE: usize = 10;
-const NUM_THREADS: usize = 1;
+const BATCH_SIZE: usize = 40;
+const NUM_THREADS: usize = 4;
 
 
 struct Rng(u64);
@@ -192,9 +192,9 @@ fn get_random_tweak(rng: &mut Rng, max_len: usize) -> Vec<(usize, u8)> {
     let mut tweak = vec![(0usize, 0u8); rng.rand() % 8];
     tweak
         .iter_mut()
-        .map(|(mut idx, mut val)| {
-            idx = rng.rand() % max_len;
-            val = (rng.rand() % 255) as u8;
+        .for_each(|(idx, val)| {
+            *idx = rng.rand() % max_len;
+            *val = (rng.rand() % 255) as u8;
         });
     tweak
 }

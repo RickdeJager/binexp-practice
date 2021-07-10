@@ -1,8 +1,6 @@
 /// Handles all virtual files on the system. Each Emulator will get its own dedicated FilePool
 /// struct that holds files from the corpus.
 
-//use std::rc::Rc;
-use std::sync::Arc;
 use std::collections::HashMap;
 
 
@@ -128,7 +126,8 @@ struct Fd {
     /// TODO; PERMS
 
     /// The actual file we're pointing to. (None in case of stdin/stdout)
-    file: Arc<File>,
+    /// TODO; Convert this to some kind of ref
+    file: File,
 
     /// Offset into the file
     offset: usize,
@@ -225,14 +224,14 @@ impl FilePool {
     /// Assign an Fd to a file in the file pool
     pub fn open(&mut self, filepath: &str) -> Option<usize> {
         // Attempt to get the file from our file map
-        match self.file_map.remove(filepath) {
+        match self.file_map.get(filepath) {
             Some(file) => {
                 // Push an Fd into the filePool, return its index.
                 self.open_fds.push(Fd{
-                    file  : Arc::new(file),
+                    // TODO; This should be a ref
+                    file  : file.clone(),
                     offset: 0,
                 });
-                self.file_map.insert(filepath.to_string(), file);
                 Some(self.open_fds.len()-1)
             },
             None => None,
