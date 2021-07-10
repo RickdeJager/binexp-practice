@@ -251,6 +251,10 @@ impl Arch for RiscV {
         self.memory.reset(other_mem);
     }
 
+    fn reset_filepool(&mut self) {
+        self.filePool.reset();
+    }
+
     fn get_mem_ref(&self) -> &Mmu {
         &self.memory
     }
@@ -259,6 +263,9 @@ impl Arch for RiscV {
         &self.filePool
     }
 
+    fn apply_tweak(&self, filepath: &str, tweak: Vec<(usize, u8)>) -> Option<()> {
+        self.filePool.apply_tweak(filepath, tweak)
+    }
 
     fn tick(&mut self) -> Result<(), VmExit> {
         // Fetch the current PC.

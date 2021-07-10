@@ -24,8 +24,11 @@ pub trait Arch {
 
     fn fork(&self) -> Box<dyn Arch + Send + Sync>;
     fn reset_mem(&mut self, other_mem: &Mmu);
+    fn reset_filepool(&mut self);
     fn get_mem_ref(&self) -> &Mmu;
     fn get_filepool_ref(&self) -> &FilePool;
+
+    fn apply_tweak(&self, filepath: &str, tweak: Vec<(usize, u8)>) -> Option<()>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -86,6 +89,7 @@ impl Emulator {
     pub fn reset(&mut self, other: &Self) {
         self.arch.set_register_state(other.arch.get_register_state());
         self.arch.reset_mem(other.arch.get_mem_ref());
+        self.arch.reset_filepool();
     }
 
     /// Set the entry point of the emulator.

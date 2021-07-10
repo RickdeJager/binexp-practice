@@ -56,13 +56,7 @@ impl Stat {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Tweak {
-    mode : char,
-    value: u8,
-}
-
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct File {
     /// TODO; file level perms
 
@@ -72,16 +66,28 @@ struct File {
     /// The actual contents of the source file.
     contents: Vec<u8>,
 
-    /// `Tweak` map. Contains the changes we will apply when reading this file.
-    /// (add, delete, flip)
-    /// [a/d/f] [value]
-    tweak: HashMap<usize, Tweak>
+    /// Tweak vector. Contains all the changes we made to the current file.
+    /// (assuming only bitflips for now)
+    tweak: Vec<(usize, u8)>
 }
 
 impl File {
     /// Set a new tweak vector to influence this files contents.
-    pub fn set_tweak(&mut self, tweak: HashMap<usize, Tweak>) {
+    pub fn apply_tweak(&mut self, tweak: Vec<(usize, u8)>) {
+        for &(idx, val) in &tweak {
+            self.contents[idx] ^= val;
+        }
         self.tweak = tweak;
+    }
+
+    pub fn remove_tweak(&mut self) {
+        // Remove the tweak from the file
+        for &(idx, val) in &self.tweak {
+            self.contents[idx] ^= val;
+        }
+
+        // clear the tweak.
+        self.tweak.clear();
     }
 
     /*
@@ -148,7 +154,7 @@ impl Fd {
 #[derive(Clone)]
 pub struct FilePool {
     /// A Hashmap of all files available within this FilePool.
-    file_map: HashMap<String, Arc<File>>,
+    file_map: HashMap<String, File>,
 
     /// Vec of all currently opened FD's
     open_fds:  Vec<Fd>,
@@ -164,20 +170,15 @@ impl FilePool {
         };
         // Add dummy Fd's for stdin / stdout / stderr
         for filename in ["STDIN", "STDOUT", "STDERR"].iter() {
-    
-            // Add empty backing files
-            let file = Arc::new(File {
-                contents: vec![0],
-                tweak:    HashMap::new(),
-                stat:     Stat::new(),
-            });
 
-            // Add the file to the filemap and open an FD
-            fp.open_fds.push(Fd{
-                file: file.clone(),
-                offset: 0,
-            });
+            // Add empty backing files
+            let file = File {
+                contents: vec![0],
+                tweak:    Vec::new(),
+                stat:     Stat::new(),
+            };
             fp.file_map.insert(filename.to_string(), file);
+            fp.open(filename);
         }
         fp
     }
@@ -192,11 +193,11 @@ impl FilePool {
         file_stat.st_blocks = (contents.len() as i64 + 511) / 512;
         // Set some defaults
 
-        let file = Arc::new(File {
+        let file = File {
             stat    : file_stat,
             contents: contents, 
-            tweak   : HashMap::new(), 
-        });
+            tweak   : Vec::new(), 
+        };
         self.file_map.insert(filename.to_string(), file);
 
         Some(())
@@ -209,16 +210,29 @@ impl FilePool {
         Some((*file_ref).clone().contents.to_vec())
     }
 
+    pub fn apply_tweak(&mut self, filepath: &str, tweak: Vec<(usize, u8)>) -> Option<()> {
+        self.file_map.get_mut(filepath)?.apply_tweak(tweak);
+        Some(())
+    }
+
+    /// Remove all Fd's, and restore the underlying files.
+    pub fn reset(&mut self) {
+        self.open_fds.clear();
+        for (_, file) in self.file_map.iter_mut() {
+            file.remove_tweak();
+        }
+    }
     /// Assign an Fd to a file in the file pool
     pub fn open(&mut self, filepath: &str) -> Option<usize> {
         // Attempt to get the file from our file map
-        match self.file_map.get(filepath) {
-            Some(file_rc) => {
+        match self.file_map.remove(filepath) {
+            Some(file) => {
                 // Push an Fd into the filePool, return its index.
                 self.open_fds.push(Fd{
-                    file  : file_rc.clone(),
+                    file  : Arc::new(file),
                     offset: 0,
                 });
+                self.file_map.insert(filepath.to_string(), file);
                 Some(self.open_fds.len()-1)
             },
             None => None,
