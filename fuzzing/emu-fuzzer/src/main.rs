@@ -117,13 +117,18 @@ fn main() {
     golden_emu.set_entry(entryp);
     // Set the emu's stack pointer to point to our newly created stack pointer
     golden_emu.set_stackp(stack.0 as u64);
-
     println!(">>> Stack {:x} - {:x}", stack.0-stack_size, stack.0);
+
     
     if ONE_SHOT {
         println!(">>> run: {:x?}", golden_emu.run());
         return;
     }
+
+    // Pre-run the template emulator until the first `open` call
+    // TODO; * manually obj-dumped for now
+    //       * can't stop on read because of the ugly FD clone work-around
+    golden_emu.run_until(0x28e58).expect("Failed to pre-run the golden-emu.");
 
     // Keep track of all threads
     let mut threads = Vec::new();

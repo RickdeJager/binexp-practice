@@ -21,6 +21,7 @@ pub trait Arch {
 
     fn get_register_state(&self) -> &[u64];
     fn set_register_state(&mut self, new_regs: &[u64]) -> Option<()>;
+    fn get_program_counter(&self) -> u64;
 
     fn fork(&self) -> Box<dyn Arch + Send + Sync>;
     fn reset_mem(&mut self, other_mem: &Mmu);
@@ -110,6 +111,17 @@ impl Emulator {
             }
         }
         unreachable!();
+    }
+
+    /// Run the emulator until a certain instruction. Returns before the instruction
+    /// is executed.
+    pub fn run_until(&mut self, inst: u64) -> Option<()> {
+        loop {
+            self.arch.tick().ok()?;
+            if self.arch.get_program_counter() == inst {
+                break Some(())
+            }
+        }
     }
 }
 

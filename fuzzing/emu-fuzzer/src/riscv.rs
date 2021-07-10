@@ -127,7 +127,7 @@ impl RiscV {
         }
     }
 
-    fn get_register(&mut self, reg: Register) -> u64 {
+    fn get_register(&self, reg: Register) -> u64 {
         if reg != Register::Zero {
             return self.get_register_raw(reg as usize).unwrap()
         }
@@ -231,6 +231,10 @@ impl Arch for RiscV {
 
     fn get_register_state(&self) -> &[u64] {
         &(self.registers)
+    }
+
+    fn get_program_counter(&self) -> u64 {
+        self.get_register(Register::Pc)
     }
 
     fn set_register_state(&mut self, new_regs: &[u64]) -> Option<()> {
