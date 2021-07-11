@@ -8,7 +8,7 @@ pub enum Archs {
 }
 
 pub trait PreArch: Arch {
-    fn new(mmu: Mmu, filePool: FilePool) -> Box<dyn Arch + Send + Sync>;
+    fn new(mmu: Mmu, file_pool: FilePool) -> Box<dyn Arch + Send + Sync>;
 }
 
 pub trait Arch {
@@ -68,11 +68,11 @@ pub struct Emulator {
 
 impl Emulator {
     // Create a new emulator, using a predefined block of memory and a stack size.
-    pub fn new(chosen_arch: Archs, mem: Mmu, filePool: FilePool) -> Self {
+    pub fn new(chosen_arch: Archs, mem: Mmu, file_pool: FilePool) -> Self {
         match chosen_arch {
             Archs::RiscV => {
                 Emulator{
-                    arch: riscv::RiscV::new(mem, filePool),
+                    arch: riscv::RiscV::new(mem, file_pool),
                 }
             },
         }

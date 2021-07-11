@@ -104,15 +104,15 @@ pub struct RiscV {
     /// FilePool
     // TODO; Not super comfortable with having the filepool be a member of a specific Arch
     // struct. Move to emu if ownership allows for it.
-    filePool: FilePool,
+    file_pool: FilePool,
 }
 
 impl PreArch for RiscV {
-    fn new(mmu: Mmu, filePool: FilePool) -> Box<dyn Arch + Send + Sync> {
+    fn new(mmu: Mmu, file_pool: FilePool) -> Box<dyn Arch + Send + Sync> {
         Box::new(RiscV {
             registers: [0u64; NUM_REGISTERS],
             memory   : mmu,
-            filePool : filePool,
+            file_pool : file_pool,
         })
     }
 }
@@ -155,13 +155,13 @@ impl RiscV {
             },
             // lseek
             62  => {
-                let ret = syscall::lseek(&mut self.filePool, a0 as i64, a1 as i64, a2 as i32)?;
+                let ret = syscall::lseek(&mut self.file_pool, a0 as i64, a1 as i64, a2 as i32)?;
                 self.set_register(Register::A0, ret as u64);
                 Ok(())
             },
             // read
             63  => {
-                let ret = syscall::read(&mut self.filePool, &mut self.memory, 
+                let ret = syscall::read(&mut self.file_pool, &mut self.memory, 
                                         a0 as i64, VirtAddr(a1 as usize), a2 as usize)?;
                 self.set_register(Register::A0, ret as u64);
                 Ok(())
@@ -174,7 +174,7 @@ impl RiscV {
             },
             // fstat
             80  => {
-                let ret: i64 = syscall::fstat(&mut self.memory, &self.filePool,
+                let ret: i64 = syscall::fstat(&mut self.memory, &self.file_pool,
                                               a0 as i64, VirtAddr(a1 as usize))?;
                 self.set_register(Register::A0, ret as u64);
                 Ok(())
@@ -194,7 +194,7 @@ impl RiscV {
             1024 => {
                 // Get the pathname as a c string.
                 let path = util::get_c_string(&self.memory, VirtAddr(a0 as usize))?;
-                let ret = syscall::open(&mut self.filePool, &path, a1 as i64)?;
+                let ret = syscall::open(&mut self.file_pool, &path, a1 as i64)?;
                 self.set_register(Register::A0, ret as u64);
                 Ok(())
             },
@@ -247,7 +247,7 @@ impl Arch for RiscV {
             registers: <[u64; NUM_REGISTERS]>::try_from(
                            self.get_register_state().clone()).unwrap(),
             memory: self.memory.fork(),
-            filePool: self.filePool.clone()
+            file_pool: self.file_pool.clone()
         })
     }
 
@@ -256,7 +256,7 @@ impl Arch for RiscV {
     }
 
     fn reset_filepool(&mut self) {
-        self.filePool.reset();
+        self.file_pool.reset();
     }
 
     fn get_mem_ref(&self) -> &Mmu {
@@ -264,11 +264,11 @@ impl Arch for RiscV {
     }
 
     fn get_filepool_ref(&self) -> &FilePool {
-        &self.filePool
+        &self.file_pool
     }
 
     fn apply_tweak(&mut self, filepath: &str, tweak: Vec<(usize, u8)>) -> Option<()> {
-        self.filePool.apply_tweak(filepath, tweak)
+        self.file_pool.apply_tweak(filepath, tweak)
     }
 
     fn tick(&mut self) -> Result<(), VmExit> {

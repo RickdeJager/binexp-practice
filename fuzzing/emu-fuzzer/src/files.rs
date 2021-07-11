@@ -125,29 +125,12 @@ impl File {
 struct Fd {
     /// TODO; PERMS
 
-    /// The actual file we're pointing to. (None in case of stdin/stdout)
-    /// TODO; Convert this to some kind of ref
-    file: File,
+    /// The name of the file we're pointing to.
+    /// A FilePool can use this to get a ref on a file.
+    filename: String,
 
     /// Offset into the file
     offset: usize,
-}
-
-impl Fd {
-
-    /// Read n bytes at the current offset. Return a reference to them
-    /// Update the offset after reading
-    pub fn read(&mut self, amount: usize) -> &[u8] {
-        if self.offset >= self.file.contents.len() {
-            return &[];
-        } else {
-            let start = self.offset;
-            let end = std::cmp::min(self.file.contents.len() - self.offset, amount);
-            // Move the FD forward
-            self.offset = end;
-            return &self.file.contents[start..end];
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -225,11 +208,10 @@ impl FilePool {
     pub fn open(&mut self, filepath: &str) -> Option<usize> {
         // Attempt to get the file from our file map
         match self.file_map.get(filepath) {
-            Some(file) => {
+            Some(_) => {
                 // Push an Fd into the filePool, return its index.
                 self.open_fds.push(Fd{
-                    // TODO; This should be a ref
-                    file  : file.clone(),
+                    filename: filepath.to_string(),
                     offset: 0,
                 });
                 Some(self.open_fds.len()-1)
@@ -239,50 +221,72 @@ impl FilePool {
     }
 
     /// Stat an Fd
-    pub fn fstat(&self, fd: usize) ->  Option<&[u8]> {
+    pub fn fstat(&self, fd_num: usize) ->  Option<&[u8]> {
         // No clue what this FD is, you get a None, enjoy.
-        if fd >= self.open_fds.len() {
+        if fd_num >= self.open_fds.len() {
             return None;
         }
-        Some(self.open_fds[fd].file.stat.to_raw_bytes())
+
+        // Fetch a reference to the file. (We guarantee this file exists, if it doesn't,
+        // that's a bug in our emu and we should crash)
+        let file = self.file_map.get(&self.open_fds[fd_num].filename)
+            .expect("File management error.");
+
+        Some(file.stat.to_raw_bytes())
     }
 
     /// Read from an FD
-    pub fn read(&mut self, fd: usize, size: usize) -> Option<&[u8]> {
+    pub fn read(&mut self, fd_num: usize, amount: usize) -> Option<&[u8]> {
         // No clue what this FD is, you get a None, enjoy.
-        if fd >= self.open_fds.len() {
+        if fd_num >= self.open_fds.len() {
             return None;
         }
-        Some(self.open_fds[fd].read(size))
+
+        // Fetch a reference to the file. (We guarantee this file exists, if it doesn't,
+        // that's a bug in our emu and we should crash)
+        let file = self.file_map.get(&self.open_fds[fd_num].filename)
+            .expect("File management error.");
+
+        let fd = &self.open_fds[fd_num];
+
+        if fd.offset >= file.contents.len() {
+            return Some(&[]);
+        } else {
+            let start = fd.offset;
+            let end = std::cmp::min(file.contents.len() - fd.offset, amount);
+            // Move the FD forward
+            self.open_fds[fd_num].offset = end;
+            return Some(&file.contents[start..end]);
+        }
     }
 
     /// lseek an FD
-    /*
-       Upon successful completion, lseek() returns the resulting offset  loca‐
-       tion  as  measured  in bytes from the beginning of the file.  On error,
-       the value (off_t) -1 is returned and errno is set to indicate  the  er‐
-       ror.
-       */
-    pub fn lseek(&mut self, fd: usize, offset: i64, whence: i32) -> Option<i64> {
+    pub fn lseek(&mut self, fd_num: usize, offset: i64, whence: i32) -> Option<i64> {
         // No clue what this FD is, you get a None, enjoy.
-        if fd >= self.open_fds.len() {
+        if fd_num >= self.open_fds.len() {
             return None;
         }
+
+        // Fetch a reference to the file. (We guarantee this file exists, if it doesn't,
+        // that's a bug in our emu and we should crash)
+        let file = self.file_map.get(&self.open_fds[fd_num].filename)
+            .expect("File management error.");
+
         match whence {
             SEEK_SET => {
                 // TODO; This is not accurate, must rewrite Fds a little to allow for negative
                 // file offsets.
-                self.open_fds[fd].offset = std::cmp::max(0, offset) as usize;
+                self.open_fds[fd_num].offset = std::cmp::max(0, offset) as usize;
                 Some(offset)
             },
             SEEK_CUR => {
-                self.open_fds[fd].offset = (self.open_fds[fd].offset as i64 + offset) as usize;
-                Some(self.open_fds[fd].offset as i64)
+                self.open_fds[fd_num].offset = 
+                    (self.open_fds[fd_num].offset as i64 + offset) as usize;
+                Some(self.open_fds[fd_num].offset as i64)
             },
             SEEK_END => {
-                self.open_fds[fd].offset = (self.open_fds[fd].file.contents.len() as i64 + offset)
-                    as usize;
-                Some(self.open_fds[fd].offset as i64)
+                self.open_fds[fd_num].offset = (file.contents.len() as i64 + offset) as usize;
+                Some(self.open_fds[fd_num].offset as i64)
             },
 
             _ => Some(-1),

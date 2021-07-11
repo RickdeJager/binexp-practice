@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-
 pub const ALLOW_GUEST_PRINT: bool = false;
 pub const ONE_SHOT: bool = false;
 
@@ -25,7 +24,7 @@ pub const CRASHES_DIR: &str = "./crashes";
 pub const CORPUS_DIR : &str = "./corpus";
 pub const TEST_FILE : &str = "testfile";
 
-const BATCH_SIZE: usize = 40;
+const BATCH_SIZE: usize = 400;
 const NUM_THREADS: usize = 4;
 
 
@@ -127,7 +126,6 @@ fn main() {
 
     // Pre-run the template emulator until the first `open` call
     // TODO; * manually obj-dumped for now
-    //       * can't stop on read because of the ugly FD clone work-around
     golden_emu.run_until(0x28e58).expect("Failed to pre-run the golden-emu.");
 
     // Keep track of all threads
