@@ -1,6 +1,7 @@
 /// Handles all virtual files on the system. Each Emulator will get its own dedicated FilePool
 /// struct that holds files from the corpus.
 
+use std::fs;
 use std::collections::HashMap;
 
 
@@ -135,6 +136,9 @@ struct Fd {
 
 #[derive(Clone)]
 pub struct FilePool {
+    /// A corpus containing all files, and derived files based on coverage/crashes
+    corpus: Vec<File>,
+
     /// A Hashmap of all files available within this FilePool.
     file_map: HashMap<String, File>,
 
@@ -145,11 +149,40 @@ pub struct FilePool {
 
 impl FilePool {
 
-    pub fn new() -> Self {
+    /// Create a filepool from a directory
+    pub fn new_dir(corpus_dir: &str) -> Option<Self> {
         let mut fp = FilePool{
+            corpus  : Vec::new(),
             file_map: HashMap::new(),
             open_fds: Vec::new(),
         };
+
+        // Load the initial corpus
+        for file_name in fs::read_dir(corpus_dir).ok()? {
+            let file_name = file_name
+                .ok()?.path().file_name()?.to_string_lossy().into_owned();
+            fp.add(&file_name);
+        }
+
+        fp.setup();
+        Some(fp)
+    }
+
+    /// Create a filepool from a single corpus file.
+    pub fn new_file(file_path: &str) -> Self {
+        let mut fp = FilePool{
+            corpus  : Vec::new(),
+            file_map: HashMap::new(),
+            open_fds: Vec::new(),
+        };
+        fp.add(&file_path);
+        fp.setup();
+        fp
+    }
+
+    /// Add dummy files for STDIN/STDOUT/STDERR, Pick an initial file from the corpus,
+    /// and add it to the file_pool
+    pub fn setup(&mut self) {
         // Add dummy Fd's for stdin / stdout / stderr
         for filename in ["STDIN", "STDOUT", "STDERR"].iter() {
 
@@ -159,16 +192,19 @@ impl FilePool {
                 tweak:    Vec::new(),
                 stat:     Stat::new(),
             };
-            fp.file_map.insert(filename.to_string(), file);
-            fp.open(filename);
+            // Insert the dummy file directly into the active file map.
+            self.file_map.insert(filename.to_string(), file);
+            self.open(filename);
         }
-        fp
+
+        // Copy a file over to the file_map
+        self.file_map.insert("testfile".to_string(), self.corpus[0].clone());
     }
 
     /// Add a new file to this FilePool. FileName must be unique.
     /// The filepath is the "real" file path on disk, `filename` will be the
     /// name of the new virtual file.
-    pub fn add(&mut self, filepath: &str, filename: &str) -> Option<()> {
+    pub fn add(&mut self, filepath: &str) -> Option<()> {
         let contents = std::fs::read(filepath).ok()?;
         let mut file_stat = Stat::new();
         file_stat.st_size = contents.len() as i64;
@@ -180,7 +216,7 @@ impl FilePool {
             contents: contents, 
             tweak   : Vec::new(), 
         };
-        self.file_map.insert(filename.to_string(), file);
+        self.corpus.push(file);
 
         Some(())
     }
@@ -195,6 +231,15 @@ impl FilePool {
     pub fn apply_tweak(&mut self, filepath: &str, tweak: Vec<(usize, u8)>) -> Option<()> {
         self.file_map.get_mut(filepath)?.apply_tweak(tweak);
         Some(())
+    }
+
+    /// Pick a new random file from the corpus and copy it over to the active file pool.
+    /// If we "randomly" pick the same file, reset it instead.
+    ///
+    /// We will apply some significant bias to staying w/ the same file, as it avoids an
+    /// expensive clone action.
+    pub fn randomize() {
+
     }
 
     /// Remove all Fd's, and restore the underlying files.

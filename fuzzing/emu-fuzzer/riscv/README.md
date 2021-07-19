@@ -24,3 +24,13 @@ CC=/ssd/toolchain/riscv64i/bin/riscv64-unknown-elf-gcc make
 ```
 qemu-riscv64 hello_world
 ```
+
+## Crosscompiling
+
+### Autotools
+
+```
+autoreconf -i
+CC=/path/to/riscv64-unknown-linux-gnu-gcc ./configure --host=x86_64
+make
+```

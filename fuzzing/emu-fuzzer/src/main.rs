@@ -7,6 +7,7 @@ mod riscv;
 mod util;
 mod syscall;
 mod files;
+mod ui;
 
 use std::fs;
 use mmu::{Mmu, VirtAddr};
@@ -19,13 +20,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const ALLOW_GUEST_PRINT: bool = false;
 pub const ONE_SHOT: bool = false;
+pub const FLASHY: bool = false;
 
 pub const CRASHES_DIR: &str = "./crashes";
 pub const CORPUS_DIR : &str = "./corpus";
 pub const TEST_FILE : &str = "testfile";
 
 const BATCH_SIZE: usize = 400;
-const NUM_THREADS: usize = 4;
+const NUM_THREADS: usize = 8;
 
 
 struct Rng(u64);
@@ -51,7 +53,7 @@ impl Rng {
 
 
 #[derive(Default)]
-struct Stats {
+pub struct Stats {
     // Total number of fuzz cases performed
     fuzz_cases: AtomicUsize,
 
@@ -65,8 +67,8 @@ struct Stats {
 fn main() {
     let binary_path = "./riscv/text-file-parser";
     let corpus_file = "./corpus/lipsum.vf";
-    let mmu_size   = 1024 * 256;
-    let stack_size = 1024 * 8;
+    let mmu_size   = 1024 * 1024;
+    let stack_size = 1024 * 512;
     let mut memory = Mmu::new(mmu_size);
     let entryp = load_elf(binary_path, &mut memory).expect("Failed to parse ELF.");
     // Create a stack
@@ -108,8 +110,8 @@ fn main() {
     push_i!(argv.len() as u64); // ARGC
 
     // Add a files to the filePool
-    let mut file_pool = files::FilePool::new();
-    file_pool.add(corpus_file, TEST_FILE).expect("Failed to load real file from disk.");
+    let file_pool = files::FilePool::new_file(corpus_file);
+//    file_pool.add(corpus_file).expect("Failed to load real file from disk.");
     let mut golden_emu = Emulator::new(Archs::RiscV, memory, file_pool);
 
     // Set the emu's entry point
@@ -126,7 +128,7 @@ fn main() {
 
     // Pre-run the template emulator until the first `open` call
     // TODO; * manually obj-dumped for now
-    golden_emu.run_until(0x28e58).expect("Failed to pre-run the golden-emu.");
+  //  golden_emu.run_until(0x28e58).expect("Failed to pre-run the golden-emu.");
 
     // Keep track of all threads
     let mut threads = Vec::new();
@@ -146,21 +148,29 @@ fn main() {
     // Start a timer
     let start = Instant::now();
 
-    let mut last_inst  = 0usize;
-    let mut last_cases = 0usize;
 
-    loop {
-        std::thread::sleep(Duration::from_millis(1000));
+    if FLASHY {
+        let mut ui = ui::Ui::new(stats.clone()).expect("Failed to create UI.");
+        loop {
+            ui.tick(start.elapsed());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    } else {
+        let mut last_inst  = 0usize;
+        let mut last_cases = 0usize;
+        loop {
+            let elapsed = start.elapsed().as_secs_f64();
+            std::thread::sleep(Duration::from_millis(1000));
+            let cases = stats.fuzz_cases.load(Ordering::SeqCst);
+            let inst = stats.instructions.load(Ordering::SeqCst);
+            let crashes = stats.crashes.load(Ordering::SeqCst);
+            print!("[{:10.3}] Cases {:10} | FCpS {:10.0} | MIpS {:10.3} | Crashes {:5}\n", 
+                   elapsed, cases, cases - last_cases, (inst - last_inst) as f64 / 1000000f64, 
+                   crashes);
 
-        let elapsed = start.elapsed().as_secs_f64();
-        let cases = stats.fuzz_cases.load(Ordering::SeqCst);
-        let inst = stats.instructions.load(Ordering::SeqCst);
-        let crashes = stats.crashes.load(Ordering::SeqCst);
-        print!("[{:10.3}] Cases {:10} | FCpS {:10.0} | MIpS {:10.3} | Crashes {:5}\n", 
-               elapsed, cases, cases - last_cases, (inst - last_inst) as f64 / 1000000f64, crashes);
-
-        last_inst  = inst;
-        last_cases = cases;
+            last_inst  = inst;
+            last_cases = cases;
+        }
     }
 }
 
@@ -197,7 +207,7 @@ fn get_random_tweak(rng: &mut Rng, max_len: usize) -> Vec<(usize, u8)> {
         .iter_mut()
         .for_each(|(idx, val)| {
             *idx = rng.rand() % max_len;
-            *val = (rng.rand() % 255) as u8;
+            *val = (rng.rand() % 256) as u8;
         });
     tweak
 }
