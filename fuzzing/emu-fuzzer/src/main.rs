@@ -20,7 +20,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const ALLOW_GUEST_PRINT: bool = false;
 pub const ONE_SHOT: bool = false;
-pub const FLASHY: bool = false;
+pub const FLASHY: bool = true;
+// update interval in millis
+pub const INTERVAL: u64 = 500;
 
 pub const CRASHES_DIR: &str = "./crashes";
 pub const CORPUS_DIR : &str = "./corpus";
@@ -128,7 +130,7 @@ fn main() {
 
     // Pre-run the template emulator until the first `open` call
     // TODO; * manually obj-dumped for now
-  //  golden_emu.run_until(0x28e58).expect("Failed to pre-run the golden-emu.");
+    golden_emu.run_until(0x28e58).expect("Failed to pre-run the golden-emu.");
 
     // Keep track of all threads
     let mut threads = Vec::new();
@@ -150,10 +152,11 @@ fn main() {
 
 
     if FLASHY {
-        let mut ui = ui::Ui::new(stats.clone()).expect("Failed to create UI.");
+        let mut ui = ui::Ui::new(stats.clone(), INTERVAL as f64 / 1000f64)
+            .expect("Failed to create UI.");
         loop {
             ui.tick(start.elapsed());
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(INTERVAL));
         }
     } else {
         let mut last_inst  = 0usize;
@@ -183,7 +186,7 @@ fn worker(golden_emu: Arc<Emulator>, thread_id: usize, stats: Arc<Stats>) {
         let mut instructions = 0usize;
         let mut crashes = 0usize;
         for _ in 0..BATCH_SIZE {
-            emu.arch.apply_tweak(TEST_FILE, get_random_tweak(&mut rng, 3));
+            emu.arch.apply_random_tweak(&mut rng, 8);
             let ret = emu.run();
 
             instructions += ret.0;
@@ -201,16 +204,7 @@ fn worker(golden_emu: Arc<Emulator>, thread_id: usize, stats: Arc<Stats>) {
     }
 }
 
-fn get_random_tweak(rng: &mut Rng, max_len: usize) -> Vec<(usize, u8)> {
-    let mut tweak = vec![(0usize, 0u8); rng.rand() % 8];
-    tweak
-        .iter_mut()
-        .for_each(|(idx, val)| {
-            *idx = rng.rand() % max_len;
-            *val = (rng.rand() % 256) as u8;
-        });
-    tweak
-}
+
 
 /// Takes an emulator and generates a crash input from the current vm state.
 fn crash_handler(emu: &Emulator, exit: &VmExit) {

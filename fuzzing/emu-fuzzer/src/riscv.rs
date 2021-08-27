@@ -7,6 +7,7 @@ use crate::mmu::{PERM_READ, PERM_EXEC};
 use crate::syscall;
 use crate::files::FilePool;
 use crate::util;
+use crate::Rng;
 
 use std::convert::TryFrom;
 
@@ -267,8 +268,8 @@ impl Arch for RiscV {
         &self.file_pool
     }
 
-    fn apply_tweak(&mut self, filepath: &str, tweak: Vec<(usize, u8)>) -> Option<()> {
-        self.file_pool.apply_tweak(filepath, tweak)
+    fn apply_random_tweak(&mut self, rng: &mut Rng, corruption: usize) -> Option<()> {
+        self.file_pool.apply_random_tweak(rng, corruption)
     }
 
     fn tick(&mut self) -> Result<(), VmExit> {

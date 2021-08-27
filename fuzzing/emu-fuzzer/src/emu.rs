@@ -1,5 +1,6 @@
 use crate::mmu::{Mmu, VirtAddr};
 use crate::riscv;
+use crate::Rng;
 use crate::files::FilePool;
 
 #[repr(u8)]
@@ -29,7 +30,7 @@ pub trait Arch {
     fn get_mem_ref(&self) -> &Mmu;
     fn get_filepool_ref(&self) -> &FilePool;
 
-    fn apply_tweak(&mut self, filepath: &str, tweak: Vec<(usize, u8)>) -> Option<()>;
+    fn apply_random_tweak(&mut self, r: &mut Rng, corruption: usize) -> Option<()>;
 }
 
 #[derive(Clone, Copy, Debug)]

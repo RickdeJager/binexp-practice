@@ -4,6 +4,8 @@
 use std::fs;
 use std::collections::HashMap;
 
+use crate::Rng;
+
 
 pub const SEEK_SET: i32 = 0;
 pub const SEEK_CUR: i32 = 1;
@@ -71,8 +73,20 @@ struct File {
 }
 
 impl File {
+
+    pub fn apply_random_tweak(&mut self, rng: &mut Rng, max_tweaks: usize) {
+        let mut tweak = vec![(0usize, 0u8); rng.rand() % max_tweaks];
+        tweak
+            .iter_mut()
+            .for_each(|(idx, val)| {
+                *idx = rng.rand() % self.contents.len();
+                *val = (rng.rand() % 256) as u8;
+            });
+        self.apply_tweak(tweak);
+    }
+
     /// Set a new tweak vector to influence this files contents.
-    pub fn apply_tweak(&mut self, tweak: Vec<(usize, u8)>) {
+    fn apply_tweak(&mut self, tweak: Vec<(usize, u8)>) {
         for &(idx, val) in &tweak {
             self.contents[idx] ^= val;
         }
@@ -88,37 +102,6 @@ impl File {
         // clear the tweak.
         self.tweak.clear();
     }
-
-    /*
-    /// Read a file, and take into account the active tweaks.
-    /// TODO; This might very well cause a ton of allocations, need to test perf hit.
-    ///       I expect it will be pretty bad though :(
-    ///
-    /// A much better strategy is to set/reset tweaks between fuzz cases, and edit
-    /// the file buffer in-place, but these rust iterators are so fancy :P
-    pub fn read(&self) -> Vec<u8> {
-        if self.tweak.is_empty() {
-            return self.contents.clone();
-        }
-
-        self.contents
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &x)| {
-                if let Some(tweak) = self.tweak.get(&i) {
-                    return match tweak.mode {
-                        'd' => None,
-                        // TODO; Add chars here (flatten?)
-                        'a' => Some(x),
-                        'f' => Some(x ^ tweak.value),
-                          _ => None,
-                    };
-                }
-                Some(x)
-            })
-            .collect::<Vec<u8>>()
-    }
-    */
 }
 
 /// An FD into one of the virtual files in the FilePool
