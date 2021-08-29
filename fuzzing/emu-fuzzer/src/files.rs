@@ -2,10 +2,10 @@
 /// struct that holds files from the corpus.
 
 use std::fs;
+use std::sync::Arc;
 use std::collections::HashMap;
 
 use crate::Rng;
-
 
 pub const SEEK_SET: i32 = 0;
 pub const SEEK_CUR: i32 = 1;
@@ -74,7 +74,8 @@ struct File {
 
 impl File {
 
-    pub fn apply_random_tweak(&mut self, rng: &mut Rng, max_tweaks: usize) {
+    /// Used by the main program to randomly tweak the currently selected file.
+    fn apply_random_tweak(&mut self, rng: &mut Rng, max_tweaks: usize) {
         let mut tweak = vec![(0usize, 0u8); rng.rand() % max_tweaks];
         tweak
             .iter_mut()
@@ -119,8 +120,8 @@ struct Fd {
 
 #[derive(Clone)]
 pub struct FilePool {
-    /// A corpus containing all files, and derived files based on coverage/crashes
-    corpus: Vec<File>,
+    /// A corpus ref containing all files, and derived files based on coverage/crashes
+    corpus: Arc<Corpus>,
 
     /// A Hashmap of all files available within this FilePool.
     file_map: HashMap<String, File>,
@@ -128,44 +129,28 @@ pub struct FilePool {
     /// Vec of all currently opened FD's
     open_fds:  Vec<Fd>,
 
+    /// The currently "selected" file, aka a file from the file map that we are mutating.
+    selected: File,
+
 }
 
 impl FilePool {
 
-    /// Create a filepool from a directory
-    pub fn new_dir(corpus_dir: &str) -> Option<Self> {
-        let mut fp = FilePool{
-            corpus  : Vec::new(),
-            file_map: HashMap::new(),
-            open_fds: Vec::new(),
-        };
-
-        // Load the initial corpus
-        for file_name in fs::read_dir(corpus_dir).ok()? {
-            let file_name = file_name
-                .ok()?.path().file_name()?.to_string_lossy().into_owned();
-            fp.add(&file_name);
-        }
-
-        fp.setup();
-        Some(fp)
-    }
-
-    /// Create a filepool from a single corpus file.
-    pub fn new_file(file_path: &str) -> Self {
-        let mut fp = FilePool{
-            corpus  : Vec::new(),
-            file_map: HashMap::new(),
-            open_fds: Vec::new(),
-        };
-        fp.add(&file_path);
-        fp.setup();
-        fp
-    }
-
     /// Add dummy files for STDIN/STDOUT/STDERR, Pick an initial file from the corpus,
     /// and add it to the file_pool
-    pub fn setup(&mut self) {
+    pub fn new(corpus: Arc<Corpus>) -> Self{
+        let mut ret = FilePool {
+            corpus: corpus.clone(),
+            file_map: HashMap::new(),
+            open_fds: Vec::new(),
+            // TODO; Replace with Option
+            selected: File {
+                contents: (*corpus).inputs[0].clone(),
+                tweak:    Vec::new(),
+                stat:     Stat::new(),
+             },
+        };
+
         // Add dummy Fd's for stdin / stdout / stderr
         for filename in ["STDIN", "STDOUT", "STDERR"].iter() {
 
@@ -176,44 +161,21 @@ impl FilePool {
                 stat:     Stat::new(),
             };
             // Insert the dummy file directly into the active file map.
-            self.file_map.insert(filename.to_string(), file);
-            self.open(filename);
+            ret.file_map.insert(filename.to_string(), file);
+            ret.open(filename);
+            // Manually reserve an FD TODO; yuk
+            ret.open_fds.push(Fd{
+                filename: filename.to_string(),
+                offset: 0,
+            });
         }
-
-        // Copy a file over to the file_map
-        self.file_map.insert("testfile".to_string(), self.corpus[0].clone());
-    }
-
-    /// Add a new file to this FilePool. FileName must be unique.
-    /// The filepath is the "real" file path on disk, `filename` will be the
-    /// name of the new virtual file.
-    pub fn add(&mut self, filepath: &str) -> Option<()> {
-        let contents = std::fs::read(filepath).ok()?;
-        let mut file_stat = Stat::new();
-        file_stat.st_size = contents.len() as i64;
-        file_stat.st_blocks = (contents.len() as i64 + 511) / 512;
-        // Set some defaults
-
-        let file = File {
-            stat    : file_stat,
-            contents: contents, 
-            tweak   : Vec::new(), 
-        };
-        self.corpus.push(file);
-
-        Some(())
+        ret
     }
 
     /// Dump a file from the filePool. Intended to be used by the fuzzer to get
     /// crashing outputs. Emulators should use Fd's instead.
-    pub fn dump(&self, filepath: &str) -> Option<Vec<u8>> {
-        let file_ref = self.file_map.get(filepath)?;
-        Some((*file_ref).clone().contents.to_vec())
-    }
-
-    pub fn apply_tweak(&mut self, filepath: &str, tweak: Vec<(usize, u8)>) -> Option<()> {
-        self.file_map.get_mut(filepath)?.apply_tweak(tweak);
-        Some(())
+    pub fn dump(&self) -> Option<Vec<u8>> {
+        Some(self.selected.contents.to_vec())
     }
 
     /// Pick a new random file from the corpus and copy it over to the active file pool.
@@ -221,32 +183,40 @@ impl FilePool {
     ///
     /// We will apply some significant bias to staying w/ the same file, as it avoids an
     /// expensive clone action.
-    pub fn randomize() {
+    pub fn randomize(&mut self, rng: &mut Rng, max_tweaks: usize) {
 
-    }
-
-    /// Remove all Fd's, and restore the underlying files.
-    pub fn reset(&mut self) {
-        self.open_fds.clear();
-        for (_, file) in self.file_map.iter_mut() {
-            file.remove_tweak();
+        // Every one in 5 cases we swap files.
+        if rng.rand() % 5  == 0 {
+            // Pick a new file and copy the contents.
+            let idx = rng.rand() % (*self.corpus).inputs.len();
+            self.selected.contents = (*self.corpus).inputs[idx].clone();
+        } else {
+            // Otherwise, remove the current tweak.
+            self.selected.remove_tweak();
         }
+
+        // Apply a new random tweak to the currently selected file.
+        self.selected.apply_random_tweak(rng, max_tweaks);
     }
+
+    /// Remove all open Fd's.
+    pub fn reset(&mut self) {
+        //self.open_fds.clear();
+        // Remove everything that isn't stdin/stderr/stdout
+        self.open_fds.drain(3..);
+    }
+
     /// Assign an Fd to a file in the file pool
     pub fn open(&mut self, filepath: &str) -> Option<usize> {
-        // Attempt to get the file from our file map
-        match self.file_map.get(filepath) {
-            Some(_) => {
-                // Push an Fd into the filePool, return its index.
+        if filepath == "testfile" {
                 self.open_fds.push(Fd{
                     filename: filepath.to_string(),
                     offset: 0,
                 });
-                Some(self.open_fds.len()-1)
-            },
-            None => None,
+            return Some(self.open_fds.len()-1);
         }
-    }
+        None
+   }
 
     /// Stat an Fd
     pub fn fstat(&self, fd_num: usize) ->  Option<&[u8]> {
@@ -255,12 +225,14 @@ impl FilePool {
             return None;
         }
 
-        // Fetch a reference to the file. (We guarantee this file exists, if it doesn't,
-        // that's a bug in our emu and we should crash)
-        let file = self.file_map.get(&self.open_fds[fd_num].filename)
-            .expect("File management error.");
+        if fd_num <= 2 {
+            let file = self.file_map.get(&self.open_fds[fd_num].filename)
+                .expect("File management error.");
+            return Some(file.stat.to_raw_bytes())
+        }
 
-        Some(file.stat.to_raw_bytes())
+        // For now, just assume we statted the selected file.
+        Some(self.selected.stat.to_raw_bytes())
     }
 
     /// Read from an FD
@@ -270,12 +242,12 @@ impl FilePool {
             return None;
         }
 
-        // Fetch a reference to the file. (We guarantee this file exists, if it doesn't,
-        // that's a bug in our emu and we should crash)
-        let file = self.file_map.get(&self.open_fds[fd_num].filename)
-            .expect("File management error.");
+        if fd_num <= 2 {
+            unimplemented!("read a special file");
+        }
 
         let fd = &self.open_fds[fd_num];
+        let file = &self.selected;
 
         if fd.offset >= file.contents.len() {
             return Some(&[]);
@@ -295,10 +267,10 @@ impl FilePool {
             return None;
         }
 
-        // Fetch a reference to the file. (We guarantee this file exists, if it doesn't,
-        // that's a bug in our emu and we should crash)
-        let file = self.file_map.get(&self.open_fds[fd_num].filename)
-            .expect("File management error.");
+        if fd_num <= 2 {
+            unimplemented!("read a special file");
+        }
+        let file = &self.selected;
 
         match whence {
             SEEK_SET => {
@@ -320,6 +292,34 @@ impl FilePool {
             _ => Some(-1),
         }
     }
-
-
 }
+
+
+/// Populates and handles corpus data.
+pub struct Corpus {
+    pub inputs: Vec<Vec<u8>>,
+}
+
+impl Corpus {
+    /// Populate the corpus from a specified directory.
+    pub fn new(corpus_dir: &str) -> Option<Self> {
+        let mut corpus = Corpus{
+            inputs: Vec::new(),
+        };
+
+        // Load the initial corpus by grabbing all files in the directory.
+        for file_name in fs::read_dir(corpus_dir).ok()? {
+            let contents = std::fs::read(file_name.unwrap().path()).ok()?;
+            corpus.inputs.push(contents)
+        }
+        Some(corpus)
+    }
+
+    /// Add a new file to the Corpus, given its contents as a u8 vec.
+    ///
+    /// This can be used to get feedback and rerun crashing inputs.
+    pub fn add(&mut self, contents: &Vec<u8>) {
+        self.inputs.push(contents.clone());
+    }
+}
+

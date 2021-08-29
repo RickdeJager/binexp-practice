@@ -7,7 +7,6 @@ use crate::mmu::{PERM_READ, PERM_EXEC};
 use crate::syscall;
 use crate::files::FilePool;
 use crate::util;
-use crate::Rng;
 
 use std::convert::TryFrom;
 
@@ -98,22 +97,12 @@ impl Register {
 pub struct RiscV {
     /// Register state
     registers: [u64; NUM_REGISTERS],
-
-    /// Memory obj
-    memory: Mmu,
-
-    /// FilePool
-    // TODO; Not super comfortable with having the filepool be a member of a specific Arch
-    // struct. Move to emu if ownership allows for it.
-    file_pool: FilePool,
 }
 
 impl PreArch for RiscV {
-    fn new(mmu: Mmu, file_pool: FilePool) -> Box<dyn Arch + Send + Sync> {
+    fn new() -> Box<dyn Arch + Send + Sync> {
         Box::new(RiscV {
             registers: [0u64; NUM_REGISTERS],
-            memory   : mmu,
-            file_pool : file_pool,
         })
     }
 }
@@ -137,7 +126,7 @@ impl RiscV {
 
     /// Translate RiscV syscall numbers into the proper syscall handler,
     /// and arguments / return values.
-    fn handle_syscall(&mut self) -> Result<(), VmExit> {
+    fn handle_syscall(&mut self, mmu: &mut Mmu, file_pool: &mut FilePool) -> Result<(), VmExit> {
         let nr_syscall = self.get_register(Register::A7);
 
         //DEBUG
@@ -156,26 +145,26 @@ impl RiscV {
             },
             // lseek
             62  => {
-                let ret = syscall::lseek(&mut self.file_pool, a0 as i64, a1 as i64, a2 as i32)?;
+                let ret = syscall::lseek(file_pool, a0 as i64, a1 as i64, a2 as i32)?;
                 self.set_register(Register::A0, ret as u64);
                 Ok(())
             },
             // read
             63  => {
-                let ret = syscall::read(&mut self.file_pool, &mut self.memory, 
+                let ret = syscall::read(file_pool, mmu, 
                                         a0 as i64, VirtAddr(a1 as usize), a2 as usize)?;
                 self.set_register(Register::A0, ret as u64);
                 Ok(())
             },
             // write
             64  => {
-                let ret = syscall::write(&self.memory, a0 as i64, VirtAddr(a1 as usize), a2)?;
+                let ret = syscall::write(&mmu, a0 as i64, VirtAddr(a1 as usize), a2)?;
                 self.set_register(Register::A0, ret as u64);
                 Ok(())
             },
             // fstat
             80  => {
-                let ret: i64 = syscall::fstat(&mut self.memory, &self.file_pool,
+                let ret: i64 = syscall::fstat(mmu, &file_pool,
                                               a0 as i64, VirtAddr(a1 as usize))?;
                 self.set_register(Register::A0, ret as u64);
                 Ok(())
@@ -187,15 +176,15 @@ impl RiscV {
             // brk
             214 => {
                 let size = self.get_register(Register::A0) as i64;
-                let ret = syscall::brk(&mut self.memory, size)?;
+                let ret = syscall::brk(mmu, size)?;
                 self.set_register(Register::A0, ret as u64);
                 Ok(())
             },
             // open
             1024 => {
                 // Get the pathname as a c string.
-                let path = util::get_c_string(&self.memory, VirtAddr(a0 as usize))?;
-                let ret = syscall::open(&mut self.file_pool, &path, a1 as i64)?;
+                let path = util::get_c_string(&mmu, VirtAddr(a0 as usize))?;
+                let ret = syscall::open(file_pool, &path, a1 as i64)?;
                 self.set_register(Register::A0, ret as u64);
                 Ok(())
             },
@@ -247,37 +236,15 @@ impl Arch for RiscV {
         Box::new(RiscV {
             registers: <[u64; NUM_REGISTERS]>::try_from(
                            self.get_register_state().clone()).unwrap(),
-            memory: self.memory.fork(),
-            file_pool: self.file_pool.clone()
         })
     }
 
-    fn reset_mem(&mut self, other_mem: &Mmu) {
-        self.memory.reset(other_mem);
-    }
-
-    fn reset_filepool(&mut self) {
-        self.file_pool.reset();
-    }
-
-    fn get_mem_ref(&self) -> &Mmu {
-        &self.memory
-    }
-
-    fn get_filepool_ref(&self) -> &FilePool {
-        &self.file_pool
-    }
-
-    fn apply_random_tweak(&mut self, rng: &mut Rng, corruption: usize) -> Option<()> {
-        self.file_pool.apply_random_tweak(rng, corruption)
-    }
-
-    fn tick(&mut self) -> Result<(), VmExit> {
+    fn tick(&mut self, mmu: &mut Mmu, file_pool: &mut FilePool) -> Result<(), VmExit> {
         // Fetch the current PC.
         let pc = self.get_register(Register::Pc);
         // Fetch the current instruction
         let addr = VirtAddr(pc as usize);
-        let inst = mmu_read_perms!(self.memory, addr, Perm(PERM_EXEC), u32)?;
+        let inst = mmu_read_perms!(mmu, addr, Perm(PERM_EXEC), u32)?;
 
         let opcode = inst & 0b1111111;
         //DEBUG
@@ -396,37 +363,37 @@ impl Arch for RiscV {
                 match inst.funct3 {
                     0b000 => {
                         // LB: Load byte
-                        let val = mmu_read!(self.memory, addr, i8)?;
+                        let val = mmu_read!(mmu, addr, i8)?;
                         self.set_register(inst.rd, val as i64 as u64);
                     },
                     0b001 => {
                         // LH: Load half word
-                        let val = mmu_read!(self.memory, addr, i16)?;
+                        let val = mmu_read!(mmu, addr, i16)?;
                         self.set_register(inst.rd, val as i64 as u64);
                     },
                     0b010 => {
                         // LW: Load word
-                        let val = mmu_read!(self.memory, addr, i32)?;
+                        let val = mmu_read!(mmu, addr, i32)?;
                         self.set_register(inst.rd, val as i64 as u64);
                     },
                     0b100 => {
                         // LBU: Load byte unsigned.
-                        let val = mmu_read!(self.memory, addr, u8)?;
+                        let val = mmu_read!(mmu, addr, u8)?;
                         self.set_register(inst.rd, val as u64);
                     },
                     0b101 => {
                         // LHU: Load half word unsigned
-                        let val = mmu_read!(self.memory, addr, u16)?;
+                        let val = mmu_read!(mmu, addr, u16)?;
                         self.set_register(inst.rd, val as u64);
                     },
                     0b110 => {
                         // LWU: Load word unsigned
-                        let val = mmu_read!(self.memory, addr, u32)?;
+                        let val = mmu_read!(mmu, addr, u32)?;
                         self.set_register(inst.rd, val as u64);
                     },
                     0b011 => {
                         // LD: Load double word
-                        let val = mmu_read!(self.memory, addr, i64)?;
+                        let val = mmu_read!(mmu, addr, i64)?;
                         self.set_register(inst.rd, val as u64);
                     },
                     _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
@@ -444,22 +411,22 @@ impl Arch for RiscV {
                     0b000 => {
                         // SB: Store byte
                         let val = self.get_register(inst.rs2) as u8;
-                        mmu_write!(self.memory, addr, val)?;
+                        mmu_write!(mmu, addr, val)?;
                     },
                     0b001 => {
                         // SH: Store half word
                         let val = self.get_register(inst.rs2) as u16;
-                        mmu_write!(self.memory, addr, val)?;
+                        mmu_write!(mmu, addr, val)?;
                     },
                     0b010 => {
                         // SW: Store word
                         let val = self.get_register(inst.rs2) as u32;
-                        mmu_write!(self.memory, addr, val)?;
+                        mmu_write!(mmu, addr, val)?;
                     },
                     0b011 => {
                         // SD: Store double word
                         let val = self.get_register(inst.rs2) as u64;
-                        mmu_write!(self.memory, addr, val)?;
+                        mmu_write!(mmu, addr, val)?;
                     },
                     _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
                                  inst.funct3, opcode)},
@@ -692,7 +659,7 @@ impl Arch for RiscV {
             0b1110011 => {
                 if        inst == 0b00000000000000000000000001110011 {
                     // ECALL
-                    self.handle_syscall()?;
+                    self.handle_syscall(mmu, file_pool)?;
                 } else if inst == 0b00000000000100000000000001110011 {
                     // EBREAK
                 } else {

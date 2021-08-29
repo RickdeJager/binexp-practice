@@ -20,19 +20,23 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const ALLOW_GUEST_PRINT: bool = false;
 pub const ONE_SHOT: bool = false;
-pub const FLASHY: bool = true;
+pub const FLASHY: bool = false;
 // update interval in millis
 pub const INTERVAL: u64 = 500;
 
+// I/O settings
 pub const CRASHES_DIR: &str = "./crashes";
 pub const CORPUS_DIR : &str = "./corpus";
 pub const TEST_FILE : &str = "testfile";
 
-const BATCH_SIZE: usize = 400;
-const NUM_THREADS: usize = 8;
+// Statistics
+const BATCH_SIZE: usize = 10;
+const NUM_THREADS: usize = 1;
 
+// Fuzzy tweakables
+const CORRUPTION_AMOUNT: usize = 8;
 
-struct Rng(u64);
+pub struct Rng(u64);
 
 impl Rng {
     // Constructor
@@ -68,10 +72,10 @@ pub struct Stats {
 
 fn main() {
     let binary_path = "./riscv/text-file-parser";
-    let corpus_file = "./corpus/lipsum.vf";
-    let mmu_size   = 1024 * 1024;
-    let stack_size = 1024 * 512;
-    let mut memory = Mmu::new(mmu_size);
+    let corpus_dir  = "./corpus/";
+    let mmu_size    = 1024 * 1024;
+    let stack_size  = 1024 * 512;
+    let mut memory  = Mmu::new(mmu_size);
     let entryp = load_elf(binary_path, &mut memory).expect("Failed to parse ELF.");
     // Create a stack
     let mut stack = memory.allocate_stack(stack_size).expect("Failed to allocate stack.");
@@ -111,9 +115,12 @@ fn main() {
     }
     push_i!(argv.len() as u64); // ARGC
 
-    // Add a files to the filePool
-    let file_pool = files::FilePool::new_file(corpus_file);
-//    file_pool.add(corpus_file).expect("Failed to load real file from disk.");
+    // Create a corpus:
+    let corpus = Arc::new(files::Corpus::new(corpus_dir)
+                    .expect("Failed to load real file from disk."));
+
+
+    let file_pool = files::FilePool::new(corpus);
     let mut golden_emu = Emulator::new(Archs::RiscV, memory, file_pool);
 
     // Set the emu's entry point
@@ -186,13 +193,13 @@ fn worker(golden_emu: Arc<Emulator>, thread_id: usize, stats: Arc<Stats>) {
         let mut instructions = 0usize;
         let mut crashes = 0usize;
         for _ in 0..BATCH_SIZE {
-            emu.arch.apply_random_tweak(&mut rng, 8);
+            emu.file_pool.randomize(&mut rng, CORRUPTION_AMOUNT);
             let ret = emu.run();
 
             instructions += ret.0;
             if !matches!(ret.1, VmExit::Exit(_)) {
                 crashes += 1;
-                crash_handler(&emu, &ret.1);
+                //crash_handler(&emu, &ret.1);
             }
 
             emu.reset(&golden_emu);
@@ -204,15 +211,13 @@ fn worker(golden_emu: Arc<Emulator>, thread_id: usize, stats: Arc<Stats>) {
     }
 }
 
-
-
 /// Takes an emulator and generates a crash input from the current vm state.
 fn crash_handler(emu: &Emulator, exit: &VmExit) {
     // Dump register state:
     let regs = emu.arch.get_register_state();
 
     // Get a copy of the current file
-    let crash_file = emu.arch.get_filepool_ref().dump(TEST_FILE).unwrap();
+    let crash_file = emu.file_pool.dump().unwrap();
 
     // Write the crash file
     // TODO; Check if the output path already exists before blindly writing to disk.
@@ -220,3 +225,4 @@ fn crash_handler(emu: &Emulator, exit: &VmExit) {
                               CRASHES_DIR, regs[riscv::Register::Pc as usize], exit);
     fs::write(output_path, &crash_file).expect("Failed to write crash file.");
 }
+

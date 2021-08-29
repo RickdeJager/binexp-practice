@@ -1,6 +1,5 @@
 use crate::mmu::{Mmu, VirtAddr};
 use crate::riscv;
-use crate::Rng;
 use crate::files::FilePool;
 
 #[repr(u8)]
@@ -9,12 +8,12 @@ pub enum Archs {
 }
 
 pub trait PreArch: Arch {
-    fn new(mmu: Mmu, file_pool: FilePool) -> Box<dyn Arch + Send + Sync>;
+    fn new() -> Box<dyn Arch + Send + Sync>;
 }
 
 pub trait Arch {
 
-    fn tick(&mut self) -> Result<(), VmExit>;
+    fn tick(&mut self, mmu: &mut Mmu, file_pool: &mut FilePool) -> Result<(), VmExit>;
     fn get_register_raw(&self, reg: usize) -> Option<u64>;
     fn set_register_raw(&mut self, reg: usize, value: u64) -> Option<()>;
     fn set_entry(&mut self, value: u64);
@@ -25,12 +24,6 @@ pub trait Arch {
     fn get_program_counter(&self) -> u64;
 
     fn fork(&self) -> Box<dyn Arch + Send + Sync>;
-    fn reset_mem(&mut self, other_mem: &Mmu);
-    fn reset_filepool(&mut self);
-    fn get_mem_ref(&self) -> &Mmu;
-    fn get_filepool_ref(&self) -> &FilePool;
-
-    fn apply_random_tweak(&mut self, r: &mut Rng, corruption: usize) -> Option<()>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -65,15 +58,23 @@ pub enum VmExit {
 pub struct Emulator {
     /// The architecture struct that this emu will exec.
     pub arch: Box<dyn Arch + Send + Sync>,
+
+    /// The Memory management unit for this emulator
+    mmu: Mmu,
+
+    /// The file pool from which this emulator can pull files.
+    pub file_pool: FilePool,
 }
 
 impl Emulator {
-    // Create a new emulator, using a predefined block of memory and a stack size.
+    /// Create a new emulator, using a predefined block of memory and a stack size.
     pub fn new(chosen_arch: Archs, mem: Mmu, file_pool: FilePool) -> Self {
         match chosen_arch {
             Archs::RiscV => {
                 Emulator{
-                    arch: riscv::RiscV::new(mem, file_pool),
+                    arch     : riscv::RiscV::new(),
+                    mmu      : mem,
+                    file_pool: file_pool,
                 }
             },
         }
@@ -82,7 +83,9 @@ impl Emulator {
     /// Fork the current emulator.
     pub fn fork(&self) -> Self {
         Emulator {
-            arch: self.arch.fork(),
+            arch     : self.arch.fork(),
+            mmu      : self.mmu.fork(),
+            file_pool: self.file_pool.clone(),
         }
     }
 
@@ -90,8 +93,8 @@ impl Emulator {
     /// Assumes `other` is actually an earlier version of `self`.
     pub fn reset(&mut self, other: &Self) {
         self.arch.set_register_state(other.arch.get_register_state());
-        self.arch.reset_mem(other.arch.get_mem_ref());
-        self.arch.reset_filepool();
+        self.mmu.reset(&other.mmu);
+        self.file_pool.reset();
     }
 
     /// Set the entry point of the emulator.
@@ -104,13 +107,19 @@ impl Emulator {
         self.arch.set_stackp(stackp);
     }
 
+    /// Helper function to tick the emu.
+    fn tick(&mut self) -> Result<(), VmExit> {
+        self.arch.tick(&mut self.mmu, &mut self.file_pool)
+    }
+
     /// Run the emulator until it either crashes or exits.
     pub fn run(&mut self) -> (usize, VmExit) {
         for count in 0.. {
-            if let Err(exit) = self.arch.tick(){
+            if let Err(exit) = self.tick() {
                 return (count, exit);
             }
         }
+        // Did I just solve the halting problem?
         unreachable!();
     }
 
@@ -118,7 +127,7 @@ impl Emulator {
     /// is executed.
     pub fn run_until(&mut self, inst: u64) -> Option<()> {
         loop {
-            self.arch.tick().ok()?;
+            self.tick().ok()?;
             if self.arch.get_program_counter() == inst {
                 break Some(())
             }
