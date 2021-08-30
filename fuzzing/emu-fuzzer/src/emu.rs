@@ -49,10 +49,55 @@ pub enum VmExit {
 
     /// Requested memory is out of bounds.
     AddressMiss(VirtAddr, usize),
+}
 
-    /// The VM hit an error during a subroutine, error is not 
-    /// necessarily caused by the program.
-    Meta,
+impl VmExit {
+    /// Helper function to add some structure to crash definitions
+    pub fn is_crash(self) -> Option<(FaultType, VirtAddrType)> {
+        match self {
+            VmExit::ReadFault(addr, _) => Some((FaultType::Read, addr.into())),
+            VmExit::WriteFault(addr, _) => Some((FaultType::Write, addr.into())),
+       //     VmExit::ExecFault(addr, _) => Some((FaultType::Exec, addr.into())),
+            VmExit::AddressMiss(addr, _) => Some((FaultType::Bounds, addr.into())),
+            _ => None,
+        }
+    }
+}
+
+
+/// Different types of faults
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FaultType {
+    Bounds,
+    Exec,
+    Read,
+    Write,
+    Uninit,
+}
+
+
+/// Distinguish between different types of addresses for crash deduping
+#[derive(Clone, Copy, Debug)]
+pub enum VirtAddrType {
+    // Address is literally null
+    NullAddr,
+    // Address is small (0, 32Ki]
+    SmallAddr,
+    // Address is small and negative [32Ki, 0)
+    NegativeAddr,
+    // Address is "normal"
+    NormalAddr,
+}
+
+impl From<VirtAddr> for VirtAddrType {
+    fn from(val: VirtAddr) -> Self {
+        match val.0 as i64 {
+            0           => VirtAddrType::NullAddr,
+            1..=32768   => VirtAddrType::SmallAddr,
+            -32768..=-1 => VirtAddrType::NegativeAddr,
+            _           => VirtAddrType::NormalAddr,
+        }
+    }
 }
 
 pub struct Emulator {
@@ -125,11 +170,16 @@ impl Emulator {
 
     /// Run the emulator until a certain instruction. Returns before the instruction
     /// is executed.
-    pub fn run_until(&mut self, inst: u64) -> Option<()> {
+    pub fn run_until(&mut self, inst: u64) -> Option<(usize, VmExit)> {
         loop {
-            self.tick().ok()?;
+            let pc = self.arch.get_program_counter();
+            //self.tick().ok()?;
+            if let Err(e) = self.tick() {
+                return Some((pc as usize, e))
+            }
             if self.arch.get_program_counter() == inst {
-                break Some(())
+                //break Some(())
+                break Some((inst as usize, VmExit::Exit(0)))
             }
         }
     }

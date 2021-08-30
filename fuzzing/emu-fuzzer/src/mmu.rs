@@ -157,7 +157,6 @@ impl Mmu {
 
         // Mark the new memory as uninitialized and writable.
         self.set_permissions(base, size, Perm(PERM_RAW | PERM_WRITE));
-        //self.set_permissions(base, size, Perm(PERM_READ | PERM_WRITE));
 
         Some(base)
     }

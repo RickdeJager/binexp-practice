@@ -11,7 +11,7 @@ mod ui;
 
 use std::fs;
 use mmu::{Mmu, VirtAddr};
-use emu::{Emulator, Archs, VmExit};
+use emu::{Emulator, Archs, FaultType, VirtAddrType};
 use util::load_elf;
 
 use std::time::{Duration, Instant};
@@ -30,11 +30,11 @@ pub const CORPUS_DIR : &str = "./corpus";
 pub const TEST_FILE : &str = "testfile";
 
 // Statistics
-const BATCH_SIZE: usize = 10;
-const NUM_THREADS: usize = 1;
+const BATCH_SIZE: usize = 50;
+const NUM_THREADS: usize = 8;
 
 // Fuzzy tweakables
-const CORRUPTION_AMOUNT: usize = 8;
+const CORRUPTION_AMOUNT: usize = 64;
 
 pub struct Rng(u64);
 
@@ -56,8 +56,6 @@ impl Rng {
     }
 }
 
-
-
 #[derive(Default)]
 pub struct Stats {
     // Total number of fuzz cases performed
@@ -71,10 +69,10 @@ pub struct Stats {
 }
 
 fn main() {
-    let binary_path = "./riscv/text-file-parser";
+    let binary_path = "./riscv/targets/TinyEXIF/tiny_exif";
     let corpus_dir  = "./corpus/";
-    let mmu_size    = 1024 * 1024;
-    let stack_size  = 1024 * 512;
+    let mmu_size    = 1024 * 1024 * 8;
+    let stack_size  = 1024 * 1024 * 4;
     let mut memory  = Mmu::new(mmu_size);
     let entryp = load_elf(binary_path, &mut memory).expect("Failed to parse ELF.");
     // Create a stack
@@ -137,7 +135,7 @@ fn main() {
 
     // Pre-run the template emulator until the first `open` call
     // TODO; * manually obj-dumped for now
-    golden_emu.run_until(0x28e58).expect("Failed to pre-run the golden-emu.");
+    golden_emu.run_until(0x9b19c).expect("Failed to pre-run the golden-emu.");
 
     // Keep track of all threads
     let mut threads = Vec::new();
@@ -153,10 +151,8 @@ fn main() {
         threads.push(std::thread::spawn(move || worker(golden_emu, thread_id, stats)));
     }
 
-
     // Start a timer
     let start = Instant::now();
-
 
     if FLASHY {
         let mut ui = ui::Ui::new(stats.clone(), INTERVAL as f64 / 1000f64)
@@ -174,7 +170,7 @@ fn main() {
             let cases = stats.fuzz_cases.load(Ordering::SeqCst);
             let inst = stats.instructions.load(Ordering::SeqCst);
             let crashes = stats.crashes.load(Ordering::SeqCst);
-            print!("[{:10.3}] Cases {:10} | FCpS {:10.0} | MIpS {:10.3} | Crashes {:5}\n", 
+            print!("[{:10.3}] Cases {:10} | FCpS {:10.0} | MIpS {:10.3} | Unique Crashes {:5}\n", 
                    elapsed, cases, cases - last_cases, (inst - last_inst) as f64 / 1000000f64, 
                    crashes);
 
@@ -194,12 +190,13 @@ fn worker(golden_emu: Arc<Emulator>, thread_id: usize, stats: Arc<Stats>) {
         let mut crashes = 0usize;
         for _ in 0..BATCH_SIZE {
             emu.file_pool.randomize(&mut rng, CORRUPTION_AMOUNT);
-            let ret = emu.run();
+            //let ret = emu.run();
+            let ret = emu.run_until(0x185a4).unwrap();
 
             instructions += ret.0;
-            if !matches!(ret.1, VmExit::Exit(_)) {
-                crashes += 1;
-                //crash_handler(&emu, &ret.1);
+            // TODO; Check for syscall not implemented
+            if let Some(reason) = ret.1.is_crash() {
+                crashes += crash_handler(&mut emu, &reason);
             }
 
             emu.reset(&golden_emu);
@@ -212,17 +209,22 @@ fn worker(golden_emu: Arc<Emulator>, thread_id: usize, stats: Arc<Stats>) {
 }
 
 /// Takes an emulator and generates a crash input from the current vm state.
-fn crash_handler(emu: &Emulator, exit: &VmExit) {
+fn crash_handler(emu: &mut Emulator, reason: &(FaultType, VirtAddrType)) -> usize {
     // Dump register state:
     let regs = emu.arch.get_register_state();
+    let ip   = regs[riscv::Register::Pc as usize];
 
     // Get a copy of the current file
     let crash_file = emu.file_pool.dump().unwrap();
 
-    // Write the crash file
-    // TODO; Check if the output path already exists before blindly writing to disk.
-    let output_path = format!("./{}/crash-at-{:x}-with-{:x?}", 
-                              CRASHES_DIR, regs[riscv::Register::Pc as usize], exit);
-    fs::write(output_path, &crash_file).expect("Failed to write crash file.");
+    // Determine whether this crash is "unique"
+    if emu.file_pool.add_crash(&crash_file, ip, reason) {
+
+        // If so, write the crash file to disk
+        let output_path = format!("./{}/crash-at-{:x}-with-{:x?}", CRASHES_DIR, ip, reason);
+        fs::write(output_path, &crash_file).expect("Failed to write crash file.");
+        return 1;
+    }
+    0
 }
 

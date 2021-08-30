@@ -9,6 +9,11 @@ edition = "2018"
 [dependencies]
 # Handy dandy crate for ELF/PE parsing
 goblin = "0.4"
+# Fast, non-cryptographically secure hashing for deduping
+meowhash = "0.3"
 # UI Crates
 crossterm = "0.19"
 tui = { version = "0.15", default-features = false, features = ['crossterm'] }
+
+[profile.release]
+#lto = "fat"
