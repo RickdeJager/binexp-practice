@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use meowhash::MeowHasher;
 
 use crate::Rng;
-use crate::emu::{VmExit, FaultType, VirtAddrType};
+use crate::emu::{FaultType, VirtAddrType};
 
 pub const SEEK_SET: i32 = 0;
 pub const SEEK_CUR: i32 = 1;
@@ -59,6 +59,18 @@ impl Stat {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum TweakType {
+    /// Do nothing
+    NOP,
+    /// Simple XOR with the tweaks value
+    XOR,
+    /// Set the value to a fixed byte
+    SET1,
+}
+
+static MAGIC_LIST_1: [u8; 3] = [255u8, 127u8, 0u8];
+
 #[derive(Clone, Debug)]
 struct File {
     /// TODO; file level perms
@@ -71,37 +83,84 @@ struct File {
 
     /// Tweak vector. Contains all the changes we made to the current file.
     /// (assuming only bitflips for now)
-    tweak: Vec<(usize, u8)>
+    tweak: Vec<(TweakType, usize, u8)>
 }
 
 impl File {
 
     /// Used by the main program to randomly tweak the currently selected file.
     fn apply_random_tweak(&mut self, rng: &mut Rng, max_tweaks: usize) {
+        // Prevent div by zero errors s.t. we can disable corruption by setting
+        // max_tweaks to zero.
+        if max_tweaks == 0 {
+            return;
+        }
+
         let file_len = self.contents.len();
-        self.tweak.resize(rng.rand() % max_tweaks, (0, 0));
+        self.tweak.resize(rng.rand() % max_tweaks, (TweakType::NOP, 0, 0));
 
         self.tweak
             .iter_mut()
-            .for_each(|(idx, val)| {
-                *idx = rng.rand() % file_len;
-                *val = (rng.rand() % 256) as u8;
+            .for_each(|(tt, idx, val)| {
+                // Decide how to mutate based on RNG
+                match rng.rand() % 100  {
+                    // XOR
+                    0..=66 => {
+                        *tt  = TweakType::XOR;
+                        *idx = rng.rand() % file_len;
+                        if rng.rand() % 2 == 0 {
+                            // Flip a single bit
+                            *val = 1u8 << (rng.rand() % 8) as u8;
+                        } else {
+                            // Flip multiple bits
+                            *val = (rng.rand() % 256) as u8;
+                        }
+                    },
+
+                    // SET1
+                    67..=99 => {
+                        *tt  = TweakType::SET1;
+                        *idx = rng.rand() % file_len;
+                        *val = MAGIC_LIST_1[rng.rand() % MAGIC_LIST_1.len()];
+                    },
+                    x => unreachable!(x),
+                }
             });
         self.apply_tweak();
     }
 
     /// Set a new tweak vector to influence this files contents.
     fn apply_tweak(&mut self) {
-        for &(idx, val) in &self.tweak {
-            self.contents[idx] ^= val;
-        }
+        // Grab separate references, so we don't keep `self` borrowed as mutable.
+        let tweak = &mut self.tweak;
+        let contents = &mut self.contents;
+        tweak.iter_mut().for_each(|(tt, idx, val)| {
+           match tt {
+                TweakType::NOP   => {},
+                TweakType::XOR   => contents[*idx] ^= *val,
+                TweakType::SET1 => {
+                    let tmp = contents[*idx];
+                    contents[*idx] = *val;
+                    *val = tmp;
+                },
+            }
+        });
     }
 
     pub fn remove_tweak(&mut self) {
-        // Remove the tweak from the file
-        for &(idx, val) in &self.tweak {
-            self.contents[idx] ^= val;
-        }
+        // Grab separate references, so we don't keep `self` borrowed as mutable.
+        let tweak = &mut self.tweak;
+        let contents = &mut self.contents;
+        // Remove tweaks from the file in reverse order to obtain the original file.
+        tweak.iter_mut().rev().for_each(|(tt, idx, val)| {
+           match tt {
+                TweakType::NOP   => {},
+                TweakType::XOR => contents[*idx] ^= *val,
+                TweakType::SET1 => {
+                    contents[*idx] = *val;
+                },
+            }
+        });
 
         // clear the tweak.
         self.tweak.clear();

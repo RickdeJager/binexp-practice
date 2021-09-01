@@ -81,3 +81,10 @@ pub fn c_strlen(mmu: &Mmu, addr: VirtAddr) -> Result<usize, VmExit> {
     }
     unreachable!()
 }
+
+/// Get a timestamp from the arch's rdtsc
+pub fn rdtsc() -> u64 {
+    unsafe { std::arch::x86_64::_rdtsc() }
+}
+
+

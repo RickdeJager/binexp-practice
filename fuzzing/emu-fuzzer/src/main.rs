@@ -7,7 +7,6 @@ mod riscv;
 mod util;
 mod syscall;
 mod files;
-mod ui;
 
 use std::fs;
 use mmu::{Mmu, VirtAddr};
@@ -16,13 +15,10 @@ use util::load_elf;
 
 use std::time::{Duration, Instant};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 
 pub const ALLOW_GUEST_PRINT: bool = false;
 pub const ONE_SHOT: bool = false;
-pub const FLASHY: bool = false;
-// update interval in millis
-pub const INTERVAL: u64 = 500;
 
 // I/O settings
 pub const CRASHES_DIR: &str = "./crashes";
@@ -31,10 +27,10 @@ pub const TEST_FILE : &str = "testfile";
 
 // Statistics
 const BATCH_SIZE: usize = 50;
-const NUM_THREADS: usize = 8;
+const NUM_THREADS: usize = 1;
 
 // Fuzzy tweakables
-const CORRUPTION_AMOUNT: usize = 64;
+const CORRUPTION_AMOUNT: usize = 32;
 
 pub struct Rng(u64);
 
@@ -58,21 +54,33 @@ impl Rng {
 
 #[derive(Default)]
 pub struct Stats {
-    // Total number of fuzz cases performed
+    /// Total number of cycles spent by a VM
+    total_cycles: AtomicU64,
+
+    /// Total number of cycles spent on mutation
+    mut_cycles: AtomicU64,
+
+    /// Total number of cycles spent on VM operation
+    vm_cycles: AtomicU64,
+
+    /// Total number of cycles spent resetting / mutating
+    reset_cycles: AtomicU64,
+
+    /// Total number of fuzz cases performed
     fuzz_cases: AtomicUsize,
 
-    // Total number of crashes
+    /// Total number of crashes
     crashes: AtomicUsize,
 
-    // Total number of instructions executed
+    /// Total number of instructions executed
     instructions: AtomicUsize,
 }
 
 fn main() {
     let binary_path = "./riscv/targets/TinyEXIF/tiny_exif";
     let corpus_dir  = "./corpus/";
-    let mmu_size    = 1024 * 1024 * 8;
-    let stack_size  = 1024 * 1024 * 4;
+    let mmu_size    = 1024 * 1024 * 2;
+    let stack_size  = 1024 * 1024;
     let mut memory  = Mmu::new(mmu_size);
     let entryp = load_elf(binary_path, &mut memory).expect("Failed to parse ELF.");
     // Create a stack
@@ -130,6 +138,7 @@ fn main() {
     
     if ONE_SHOT {
         println!(">>> run: {:x?}", golden_emu.run());
+        println!(">>> PC : {:x?}", golden_emu.arch.get_program_counter());
         return;
     }
 
@@ -154,29 +163,26 @@ fn main() {
     // Start a timer
     let start = Instant::now();
 
-    if FLASHY {
-        let mut ui = ui::Ui::new(stats.clone(), INTERVAL as f64 / 1000f64)
-            .expect("Failed to create UI.");
-        loop {
-            ui.tick(start.elapsed());
-            std::thread::sleep(Duration::from_millis(INTERVAL));
-        }
-    } else {
-        let mut last_inst  = 0usize;
-        let mut last_cases = 0usize;
-        loop {
-            let elapsed = start.elapsed().as_secs_f64();
-            std::thread::sleep(Duration::from_millis(1000));
-            let cases = stats.fuzz_cases.load(Ordering::SeqCst);
-            let inst = stats.instructions.load(Ordering::SeqCst);
-            let crashes = stats.crashes.load(Ordering::SeqCst);
-            print!("[{:10.3}] Cases {:10} | FCpS {:10.0} | MIpS {:10.3} | Unique Crashes {:5}\n", 
-                   elapsed, cases, cases - last_cases, (inst - last_inst) as f64 / 1000000f64, 
-                   crashes);
+    let mut last_inst  = 0usize;
+    let mut last_cases = 0usize;
+    loop {
+        let elapsed = start.elapsed().as_secs_f64();
+        std::thread::sleep(Duration::from_millis(1000));
+        let cases = stats.fuzz_cases.load(Ordering::SeqCst);
+        let inst = stats.instructions.load(Ordering::SeqCst);
+        let crashes = stats.crashes.load(Ordering::SeqCst);
 
-            last_inst  = inst;
-            last_cases = cases;
-        }
+        let cycles        = stats.total_cycles.load(Ordering::SeqCst) as f64;
+        let percent_vm    = stats.vm_cycles.load(Ordering::SeqCst) as f64 / cycles;
+        let percent_mut   = stats.mut_cycles.load(Ordering::SeqCst) as f64 / cycles;
+        let percent_reset = stats.reset_cycles.load(Ordering::SeqCst) as f64 / cycles;
+        print!("[{:10.3}] Cases {:10} | FCpS {:10.0} | MIpS {:10.3} | Unique Crashes {:5}
+             Reset {:10.4} | Mut  {:10.4} | VM   {:10.4} | \n", 
+               elapsed, cases, cases - last_cases, (inst - last_inst) as f64 / 1000000f64, crashes,
+               percent_reset, percent_mut, percent_vm);
+
+        last_inst  = inst;
+        last_cases = cases;
     }
 }
 
@@ -188,10 +194,19 @@ fn worker(golden_emu: Arc<Emulator>, thread_id: usize, stats: Arc<Stats>) {
     loop {
         let mut instructions = 0usize;
         let mut crashes = 0usize;
+        let mut reset_cycles = 0u64;
+        let mut vm_cycles = 0u64;
+        let mut mut_cycles = 0u64;
+        let it0 = util::rdtsc();
+
         for _ in 0..BATCH_SIZE {
+            let it = util::rdtsc();
             emu.file_pool.randomize(&mut rng, CORRUPTION_AMOUNT);
-            //let ret = emu.run();
+            mut_cycles += util::rdtsc() - it;
+            
+            let it = util::rdtsc();
             let ret = emu.run_until(0x185a4).unwrap();
+            vm_cycles += util::rdtsc() - it;
 
             instructions += ret.0;
             // TODO; Check for syscall not implemented
@@ -199,12 +214,19 @@ fn worker(golden_emu: Arc<Emulator>, thread_id: usize, stats: Arc<Stats>) {
                 crashes += crash_handler(&mut emu, &reason);
             }
 
+            let it = util::rdtsc();
             emu.reset(&golden_emu);
+            reset_cycles += util::rdtsc() - it;
         }
         // Update the statistics after completing a batch
         stats.fuzz_cases.fetch_add(BATCH_SIZE, Ordering::SeqCst);
         stats.instructions.fetch_add(instructions, Ordering::SeqCst);
         stats.crashes.fetch_add(crashes, Ordering::SeqCst);
+
+        stats.total_cycles.fetch_add(util::rdtsc() - it0, Ordering::SeqCst);
+        stats.vm_cycles.fetch_add(vm_cycles, Ordering::SeqCst);
+        stats.reset_cycles.fetch_add(reset_cycles, Ordering::SeqCst);
+        stats.mut_cycles.fetch_add(mut_cycles, Ordering::SeqCst);
     }
 }
 

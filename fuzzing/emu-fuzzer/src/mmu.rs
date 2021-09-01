@@ -10,7 +10,7 @@ pub const PERM_RAW  : u8 = 1 << 3;
 /// perf for your specific target.
 /// Setting this to a larger value causes fewer, large memcpy's to occur, setting
 /// this to a lower value causes more, smaller memcpy's to occur.
-const DIRTY_BLOCK_SIZE: usize = 512;
+const DIRTY_BLOCK_SIZE: usize = 128;
 
 /// Small little helper macro to get type lengths at compile time
 macro_rules! get_type_len {
