@@ -11,9 +11,7 @@ edition = "2018"
 goblin = "0.4"
 # Fast, non-cryptographically secure hashing for deduping
 meowhash = "0.3"
-# UI Crates
-crossterm = "0.19"
-tui = { version = "0.15", default-features = false, features = ['crossterm'] }
 
 [profile.release]
 #lto = "fat"
+overflow-checks=true

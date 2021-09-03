@@ -1,3 +1,4 @@
+#![feature(asm)]
 #[macro_use]
 // MMU defines macro's for reading/writing integer types, so must be pulled in
 // before any other modules are pulled in.
@@ -7,17 +8,19 @@ mod riscv;
 mod util;
 mod syscall;
 mod files;
+mod jitcache;
 
 use std::fs;
 use mmu::{Mmu, VirtAddr};
 use emu::{Emulator, Archs, FaultType, VirtAddrType};
 use util::load_elf;
+use jitcache::JitCache;
 
 use std::time::{Duration, Instant};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 
-pub const ALLOW_GUEST_PRINT: bool = false;
+pub const ALLOW_GUEST_PRINT: bool = true;
 pub const ONE_SHOT: bool = false;
 
 // I/O settings
@@ -30,7 +33,7 @@ const BATCH_SIZE: usize = 50;
 const NUM_THREADS: usize = 1;
 
 // Fuzzy tweakables
-const CORRUPTION_AMOUNT: usize = 32;
+const CORRUPTION_AMOUNT: usize = 0;
 
 pub struct Rng(u64);
 
@@ -78,9 +81,10 @@ pub struct Stats {
 
 fn main() {
     let binary_path = "./riscv/targets/TinyEXIF/tiny_exif";
+//    let binary_path = "./riscv/echo-file";
     let corpus_dir  = "./corpus/";
-    let mmu_size    = 1024 * 1024 * 2;
-    let stack_size  = 1024 * 1024;
+    let mmu_size    = 1024 * 1024 * 64;
+    let stack_size  = 1024 * 1024 * 32;
     let mut memory  = Mmu::new(mmu_size);
     let entryp = load_elf(binary_path, &mut memory).expect("Failed to parse ELF.");
     // Create a stack
@@ -127,12 +131,15 @@ fn main() {
 
 
     let file_pool = files::FilePool::new(corpus);
+    let jit_cache  = Arc::new(JitCache::new(VirtAddr(mmu_size)));
     let mut golden_emu = Emulator::new(Archs::RiscV, memory, file_pool);
+    golden_emu.add_jitcache(jit_cache);
 
     // Set the emu's entry point
     golden_emu.set_entry(entryp);
     // Set the emu's stack pointer to point to our newly created stack pointer
     golden_emu.set_stackp(stack.0 as u64);
+    println!(">>> Entry {:x}", entryp);
     println!(">>> Stack {:x} - {:x}", stack.0-stack_size, stack.0);
 
     
@@ -144,7 +151,13 @@ fn main() {
 
     // Pre-run the template emulator until the first `open` call
     // TODO; * manually obj-dumped for now
-    golden_emu.run_until(0x9b19c).expect("Failed to pre-run the golden-emu.");
+    //golden_emu.run_until(0x9b19c).expect("Failed to pre-run the golden-emu.");
+
+    println!(">>>>>>>>> {:?}", golden_emu.run());
+
+    unreachable!("Noice");
+
+
 
     // Keep track of all threads
     let mut threads = Vec::new();

@@ -1,6 +1,9 @@
 use crate::mmu::{Mmu, VirtAddr};
 use crate::riscv;
+use crate::jitcache::JitCache;
 use crate::files::FilePool;
+
+use std::sync::Arc;
 
 #[repr(u8)]
 pub enum Archs {
@@ -24,6 +27,9 @@ pub trait Arch {
     fn get_program_counter(&self) -> u64;
 
     fn fork(&self) -> Box<dyn Arch + Send + Sync>;
+
+    fn run_jit(&mut self, mmu: &mut Mmu, file_pool: &mut FilePool, jit_cache: &Arc<JitCache>)
+        -> Result<(), VmExit>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -49,6 +55,9 @@ pub enum VmExit {
 
     /// Requested memory is out of bounds.
     AddressMiss(VirtAddr, usize),
+
+    /// A branch occured to a location outside of the available JIT region.
+    JitOob,
 }
 
 impl VmExit {
@@ -109,6 +118,9 @@ pub struct Emulator {
 
     /// The file pool from which this emulator can pull files.
     pub file_pool: FilePool,
+
+    /// (Optional) Reference to shared JIT cache
+    pub jit_cache: Option<Arc<JitCache>>,
 }
 
 impl Emulator {
@@ -120,9 +132,14 @@ impl Emulator {
                     arch     : riscv::RiscV::new(),
                     mmu      : mem,
                     file_pool: file_pool,
+                    jit_cache: None,
                 }
             },
         }
+    }
+
+    pub fn add_jitcache(&mut self, jit_cache: Arc<JitCache>) {
+        self.jit_cache = Some(jit_cache);
     }
 
     /// Fork the current emulator.
@@ -131,6 +148,7 @@ impl Emulator {
             arch     : self.arch.fork(),
             mmu      : self.mmu.fork(),
             file_pool: self.file_pool.clone(),
+            jit_cache: self.jit_cache.clone(),
         }
     }
 
@@ -157,10 +175,31 @@ impl Emulator {
         self.arch.tick(&mut self.mmu, &mut self.file_pool)
     }
 
-    /// Run the emulator until it either crashes or exits.
+    /// Run using either the emu, or a JIT-enabled variant
     pub fn run(&mut self) -> (usize, VmExit) {
+        match self.jit_cache {
+            None    => self.run_emu(),
+            Some(_) => self.run_jit(),
+        }
+    }
+
+    /// Run the emulator until it either crashes or exits.
+    pub fn run_jit(&mut self) -> (usize, VmExit) {
+        let ret = self.arch.run_jit(&mut self.mmu, &mut self.file_pool, self.jit_cache.as_ref().unwrap());
+
+        if let Err(e) = ret{
+            return (0, e)
+        }
+        unreachable!("boop");
+    }
+
+    /// Run the emulator until it either crashes or exits.
+    pub fn run_emu(&mut self) -> (usize, VmExit) {
         for count in 0.. {
+            //let pc = self.arch.get_program_counter();
+            //println!("PC: {:#x}", pc);
             if let Err(exit) = self.tick() {
+                // DEBUG
                 return (count, exit);
             }
         }

@@ -7,8 +7,11 @@ use crate::mmu::{PERM_READ, PERM_EXEC};
 use crate::syscall;
 use crate::files::FilePool;
 use crate::util;
+use crate::jitcache::JitCache;
 
+use std::process::Command;
 use std::convert::TryFrom;
+use std::sync::Arc;
 
 /// 64 bit RISC-V registers
 const NUM_REGISTERS: usize = 33;
@@ -91,7 +94,6 @@ impl Register {
              _ => None,
         }
     }
-    
 }
 
 pub struct RiscV {
@@ -191,6 +193,674 @@ impl RiscV {
              _ => Err(VmExit::SyscallNotImplemented(nr_syscall)),
         }
     }
+
+    fn generate_jit(&mut self, pc: VirtAddr, num_blocks: usize, mmu: &mut Mmu)
+        -> Result<String, VmExit> {
+        let mut asm = "[bits 64]\n".to_string();
+        let mut pc = pc.0 as u64;
+
+        'next_inst: loop {
+            // Fetch the current instruction
+            let addr = VirtAddr(pc as usize);
+            let inst = mmu_read_perms!(mmu, addr, Perm(PERM_EXEC), u32)?;
+
+            let opcode = inst & 0b1111111;
+
+            // Add a label to this instruction
+            asm += &format!("inst_pc_{:#x}:\n", pc);
+            //DEBUG
+            //print!("Opcode: {:07b} PC: {:x?}\n", opcode, pc);
+
+
+            // Load VM register into a "real" x86 register
+            macro_rules! load_reg  {
+                ($other: expr, $reg: expr) => {
+                    if $reg == Register::Zero {
+                        // If reading from zero, force an XOR XOR instead
+                        format!("xor {other}, {other}", other = $other)
+                    } else {
+                        format!("mov {other}, qword [r13 + {reg}*8]\n", 
+                                other = $other, reg = $reg as usize)
+                    }
+                }
+            }
+
+            // Store an x86 register or immediate into a VM register.
+            macro_rules! store_reg  {
+                ($reg: expr, $other: expr) => {
+                    if $reg == Register::Zero {
+                        String::new() // Ignore stores into the Zero register.
+                    } else {
+                        format!("mov qword [r13 + {reg}*8], {other}\n", 
+                                other = $other, reg = $reg as usize)
+                    }
+                }
+            }
+
+            match opcode {
+                0b0110111 => {
+                    // LUI: Load Upper Immediate
+                    let inst = Utype::from(inst);
+                    asm += &store_reg!(inst.rd, inst.imm as i64 as u64);
+                },
+
+                0b0010111 => {
+                    // AUIPC: Add upper immediate to PC, store result in reg
+                    let inst = Utype::from(inst);
+                    let val = (inst.imm as i64 as u64).wrapping_add(pc);
+                    asm += &format!(r#"
+                        mov rax, {val:#x}
+                        {store_rd_from_rax}
+                    "#, val = val, store_rd_from_rax = store_reg!(inst.rd, "rax"));
+                },
+
+                0b1101111 => {
+                    // JAL: Jump and store the link address in reg
+                    let inst = Jtype::from(inst);
+                    let ret  =  pc.wrapping_add(4);
+                    let target = pc.wrapping_add(inst.imm as i64 as u64);
+
+                    // Bounds check the JIT target
+                    if (target / 4) >= num_blocks as u64 {
+                        return Err(VmExit::JitOob);
+                    }
+
+                    // First do the link, then lookup the jump target from the JIT map.
+                    asm += &format!(r#"
+                        mov rax, {ret}
+                        {store_rd_from_rax}
+
+                        mov rax, [r14 + {target}]
+                        test rax, rax
+                        jz .jit_resolve
+
+                        jmp rax
+
+                        .jit_resolve:
+                        mov rax, 1
+                        mov rdx, {target_pc}
+                        ret
+                        
+                    "#, ret = ret,
+                        target = (target / 4) * 8, target_pc = target,
+                        store_rd_from_rax = store_reg!(inst.rd, "rax"));
+                    break 'next_inst;
+                },
+
+                0b1100111 => {
+                    // JALR: Jump and link register
+                    let inst = Itype::from(inst);
+                    match inst.funct3 {
+                        0b000 => {
+                            let ret = pc.wrapping_add(4);
+                            asm += &format!(r#"
+                                mov rax, {ret}
+                                {store_rd_from_rax}
+
+                                {load_rax_from_rs1}
+                                add rax, {imm}
+
+                                shr rax, 2
+                                cmp rax, {num_blocks}
+                                jae .jit_resolve
+
+                                mov rax, [r14 + rax*8]
+                                test rax, rax
+                                jz .jit_resolve
+
+                                jmp rax
+
+                                .jit_resolve:
+                                {load_rdx_from_rs1}
+                                add rdx, {imm}
+                                mov rax, 1
+                                ret
+                                
+                            "#, ret = ret, imm = inst.imm,
+                                num_blocks = num_blocks,
+                                store_rd_from_rax = store_reg!(inst.rd, "rax"),
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rdx_from_rs1 = load_reg!("rdx", inst.rs1));
+                            break 'next_inst;
+                        },
+                        _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
+                                     inst.funct3, opcode)},
+                    }
+                },
+
+                0b1100011 => {
+                    // BXX: Branch instructions
+                    let inst = Btype::from(inst);
+
+                    // Compute the target address
+                    let target = pc.wrapping_add(inst.imm as i64 as u64);
+
+                    // Bounds check the JIT target
+                    if (target / 4) >= num_blocks as u64 {
+                        return Err(VmExit::JitOob);
+                    }
+
+                    // Convert RISCV branch types into corresponding x86 jump instructions
+                    // (inverted to skip a bounds check)
+                    let jmp_type = match inst.funct3 {
+                        // BEQ: Branch if EQual
+                        0b000 => "jne",
+                        // BNQ: Branch if Not eQual
+                        0b001 => "je",
+                        // BLT: Branch if less than
+                        0b100 => "jge",
+                        // BGE: Branch if greater of equal
+                        0b101 => "jl",
+                        // BLTU: Branch if less than (unsigned version)
+                        0b110 => "jae",
+                        // BGEU: Branch if greater than or equal (unsigned version)
+                        0b111 => "jb",
+                        _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
+                                     inst.funct3, opcode)},
+                    };
+
+                    asm += &format!(r#"
+                        {load_rax_from_rs1}
+                        {load_rdx_from_rs2}
+
+                        cmp rax, rdx
+                        {jmp_type} .fallthrough
+
+                        mov rax, [r14 + {target}]
+                        test rax, rax
+                        jz .jit_resolve
+
+                        jmp rax
+
+                        .jit_resolve:
+                        mov rax, 1
+                        mov rdx, {target_pc}
+                        ret
+ 
+                        .fallthrough:
+                    "#, jmp_type = jmp_type,
+                        target = (target / 4) * 8, target_pc = target,
+                        load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                        load_rdx_from_rs2 = load_reg!("rdx", inst.rs2));
+                },
+
+                0b0000011 => {
+                    // LX: Load instructions
+                    let inst = Itype::from(inst);
+
+                    let (load_type, load_size, reg) = match inst.funct3 {
+                        0b000 => ("movsx", "byte",  "rax"),    // LB : Load byte
+                        0b001 => ("movsx", "word",  "rax"),    // LH : Load half word
+                        0b010 => ("movsx", "dword", "rax"),    // LW : Load word
+                        0b011 => ("mov",   "qword", "rax"),    // LD : Load double word
+                        0b100 => ("movzx", "byte",  "rax"),    // LBU: Load byte unsigned.
+                        0b101 => ("movzx", "word",  "rax"),    // LHU: Load half word unsigned
+                        0b110 => ("mov",   "dword", "eax"),    // LWU: Load word unsigned
+                        _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
+                                     inst.funct3, opcode)},
+                    };
+
+                    asm += &format!(r#"
+                        {load_rax_from_rs1}
+                        {load_type} {reg}, {load_size} [r8 + rax + {imm}]
+                        {store_rax_into_rd}
+                    "#, imm = inst.imm,
+                        load_type = load_type, load_size = load_size, reg = reg,
+                        load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                        store_rax_into_rd = store_reg!(inst.rd, "rax"));
+                },
+                0b0100011 => {
+                    // SX: Store instructions
+                    let inst = Stype::from(inst);
+
+                    let (store_type, store_size, reg) = match inst.funct3 {
+                        0b000 => ("mov", "byte",  "dl" ),    // SB : Store byte
+                        0b001 => ("mov", "word",  "dx" ),    // SH : Store half word
+                        0b010 => ("mov", "dword", "edx"),    // SW : Store word
+                        0b011 => ("mov", "qword", "rdx"),    // SD : Store double word
+                        _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
+                                     inst.funct3, opcode)},
+                    };
+
+                    asm += &format!(r#"
+                        {load_rax_from_rs1}
+                        {load_rdx_from_rs2}
+                        {store_type} {store_size} [r8 + rax + {imm}], {reg}
+                    "#, imm = inst.imm,
+                        store_type = store_type, store_size = store_size, reg = reg,
+                        load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                        load_rdx_from_rs2 = load_reg!("rdx", inst.rs2));
+                 },
+
+                0b0010011 => {
+                    // Register-Immediate operations
+                    let inst = Itype::from(inst);
+
+                    match inst.funct3 {
+                        0b000 => {
+                            // ADDI: Add immediate to register
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                add rax, {imm}
+                                {store_rax_into_rd}
+                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"),
+                                imm = inst.imm);
+                        },
+                        0b010 => {
+                            // SLTI: Set to one if less than imm
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                xor  edx, edx
+                                cmp  rax, {imm}
+                                setl dl,
+                                {store_rdx_into_rd}
+                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                store_rdx_into_rd = store_reg!(inst.rd, "rdx"),
+                                imm = inst.imm);
+                        },
+                        0b011 => {
+                            // SLTIU: Set to one if less than imm (unsigned)
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                xor  edx, edx
+                                cmp  rax, {imm}
+                                setb dl,
+                                {store_rdx_into_rd}
+                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                store_rdx_into_rd = store_reg!(inst.rd, "rdx"),
+                                imm = inst.imm);
+                        },
+                        0b100 => {
+                            // XORI: Xor RS1 with the immediate
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                xor  rax, {imm}
+                                {store_rax_into_rd}
+                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"),
+                                imm = inst.imm);
+                        },
+                        0b110 => {
+                            // ORI: Or RS1 with the immediate
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                or  rax, {imm}
+                                {store_rax_into_rd}
+                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"),
+                                imm = inst.imm);
+                        },
+                        0b111 => {
+                            // ANDI: AND RS1 with the immediate
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                and  rax, {imm}
+                                {store_rax_into_rd}
+                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"),
+                                imm = inst.imm);
+                        },
+                        0b001 => {
+                            let mode = (inst.imm >> 6) & 0b111111;
+                            match mode {
+                                0b000000 => {
+                                    asm += &format!(r#"
+                                        {load_rax_from_rs1}
+                                        shl  rax, {shamt}
+                                        {store_rax_into_rd}
+                                    "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                        store_rax_into_rd = store_reg!(inst.rd, "rax"),
+                                        shamt = inst.imm & 0b111111);
+                                },
+                                _ => panic!("Unknown shift mode in opcode {:#09b}\n", opcode),
+                            }
+                        },
+                        0b101 => {
+                            let mode = (inst.imm >> 6) & 0b111111;
+                            let shamt = inst.imm & 0b111111;
+                            match mode {
+                                0b000000 => {
+                                    // SRLI: Shift-right logical immediate
+                                    asm += &format!(r#"
+                                        {load_rax_from_rs1}
+                                        shr  rax, {shamt}
+                                        {store_rax_into_rd}
+                                    "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                        store_rax_into_rd = store_reg!(inst.rd, "rax"),
+                                        shamt = shamt);
+                                },
+                                0b010000 => {
+                                    // SRAI: Shift-right arith immediate
+                                    asm += &format!(r#"
+                                        {load_rax_from_rs1}
+                                        sar  rax, {shamt}
+                                        {store_rax_into_rd}
+                                    "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                        store_rax_into_rd = store_reg!(inst.rd, "rax"),
+                                        shamt = shamt);
+
+                                },
+                                _ => panic!("Unknown shift mode in opcode {:#09b}\n", opcode),
+
+                            }
+                        },
+                        _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
+                                     inst.funct3, opcode)},
+                    }
+                },
+
+                0b0110011 => {
+                    // Register-Register operations
+                    let inst = Rtype::from(inst);
+
+                    match (inst.funct7, inst.funct3) {
+                        (0b0000000, 0b000) => {
+                            // ADD: Adds two registers, stores result in rd
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                {load_rdx_from_rs2}
+                                add rax, rdx
+                                {store_rax_into_rd}
+                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rdx_from_rs2 = load_reg!("rdx", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"));
+                        },
+                        (0b0100000, 0b000) => {
+                            // SUB: Subtracts two registers, stores result in rd
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                {load_rdx_from_rs2}
+                                sub rax, rdx
+                                {store_rax_into_rd}
+                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rdx_from_rs2 = load_reg!("rdx", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"));
+                        },
+                        (0b0000000, 0b001) => {
+                            // SLL: Shift-left logical
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                {load_rcx_from_rs2}
+                                shl rax, cl
+                                {store_rax_into_rd}
+                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rcx_from_rs2 = load_reg!("rcx", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"));
+                        },
+                        (0b0000000, 0b010) => {
+                            // SLT: Set less than
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                {load_rdx_from_rs2}
+                                xor ecx, ecx
+                                cmp rax, rdx
+                                setl cl
+                                {store_rcx_into_rd}
+                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rdx_from_rs2 = load_reg!("rdx", inst.rs2),
+                                store_rcx_into_rd = store_reg!(inst.rd, "rcx"));
+                        },
+                        (0b0000000, 0b011) => {
+                            // SLT: Set less than (unsigned)
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                {load_rdx_from_rs2}
+                                xor ecx, ecx
+                                cmp rax, rdx
+                                setb cl
+                                {store_rcx_into_rd}
+                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rdx_from_rs2 = load_reg!("rdx", inst.rs2),
+                                store_rcx_into_rd = store_reg!(inst.rd, "rcx"));
+                        },
+                        (0b0000000, 0b100) => {
+                            // XOR: Xor two registers
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                {load_rdx_from_rs2}
+                                xor rax, rdx
+                                {store_rax_into_rd}
+                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rdx_from_rs2 = load_reg!("rdx", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"));
+                        },
+                        (0b0000000, 0b101) => {
+                            // SRL: Shift-right locical
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                {load_rcx_from_rs2}
+                                shr rax, cl
+                                {store_rax_into_rd}
+                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rcx_from_rs2 = load_reg!("rcx", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"));
+                        },
+                        (0b0100000, 0b101) => {
+                            // SRA: Shift-right arith.
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                {load_rcx_from_rs2}
+                                sar rax, cl
+                                {store_rax_into_rd}
+                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rcx_from_rs2 = load_reg!("rcx", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"));
+                        },
+                        (0b0000000, 0b110) => {
+                            // OR: Or two registers
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                {load_rdx_from_rs2}
+                                or rax, rdx
+                                {store_rax_into_rd}
+                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rdx_from_rs2 = load_reg!("rdx", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"));
+                        },
+                        (0b0000000, 0b111) => {
+                            // AND: AND two registers
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                {load_rdx_from_rs2}
+                                and rax, rdx
+                                {store_rax_into_rd}
+                            "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rdx_from_rs2 = load_reg!("rdx", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"));
+                        },
+                        _ => {panic!(
+                                "Unknown (funct7, funct3): ({:#07b}, {:#03b}) in opcode: {:#09b}\n", 
+                                inst.funct7, inst.funct3, opcode)},
+                    }
+                },
+                0b0011011 => {
+                    // 64 bit register-immediate.
+                    let inst = Itype::from(inst);
+
+                    match inst.funct3 {
+                        0b000 => {
+                            // ADDIW: Add immediate to register
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                add eax, {imm}
+                                movsx rax, eax
+                                {store_rax_into_rd}
+                                "#,
+                                imm = inst.imm,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"));
+
+                        },
+                        0b001 => {
+                            let mode = (inst.imm >> 5) & 0b1111111;
+                            match mode {
+                                0b0000000 => {
+                                    // SLLIW: Shift-left logical immediate
+                                    let shamt = inst.imm & 0b11111;
+                                    asm += &format!(r#"
+                                        {load_rax_from_rs1}
+                                        shl eax, {shamt}
+                                        movsx rax, eax
+                                        {store_rax_into_rd}
+                                        "#,
+                                        shamt = shamt,
+                                        load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                        store_rax_into_rd = store_reg!(inst.rd, "rax"));
+                                },
+                                _ => panic!("Unknown shift mode in opcode {:#09b}\n", opcode),
+                            }
+                        },
+                        0b101 => {
+                            let mode = (inst.imm >> 5) & 0b1111111;
+                            let shamt = inst.imm & 0b11111;
+                            match mode {
+                                0b0000000 => {
+                                    // SRLIW: Shift-right logical immediate
+                                    asm += &format!(r#"
+                                        {load_rax_from_rs1}
+                                        shr eax, {shamt}
+                                        movsx rax, eax
+                                        {store_rax_into_rd}
+                                        "#,
+                                        shamt = shamt,
+                                        load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                        store_rax_into_rd = store_reg!(inst.rd, "rax"));
+                                },
+                                0b0100000 => {
+                                    // SRAIW: Shift-right arith immediate
+                                    asm += &format!(r#"
+                                        {load_rax_from_rs1}
+                                        sar eax, {shamt}
+                                        movsx rax, eax
+                                        {store_rax_into_rd}
+                                        "#,
+                                        shamt = shamt,
+                                        load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                        store_rax_into_rd = store_reg!(inst.rd, "rax"));
+                                },
+                                _ => panic!("Unknown shift mode in opcode {:#09b}\n", opcode),
+                            };
+                        },
+                        _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n",
+                                     inst.funct3, opcode)},
+                    }
+                },
+
+                0b0111011 => {
+                    // Register-Register operations (64 bit)
+                    let inst = Rtype::from(inst);
+
+                    match (inst.funct7, inst.funct3) {
+                        (0b0000000, 0b000) => {
+                            // ADDW: Adds two registers, stores result in rd
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                {load_rdx_from_rs2}
+                                add eax, edx
+                                movsx rax, eax
+                                {store_rax_into_rd}
+                                "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rdx_from_rs2 = load_reg!("rdx", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"));
+                        },
+                        (0b0100000, 0b000) => {
+                            // SUBW: Subtracts two registers, stores result in rd
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                {load_rdx_from_rs2}
+                                sub eax, edx
+                                movsx rax, eax
+                                {store_rax_into_rd}
+                                "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rdx_from_rs2 = load_reg!("rdx", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"));
+                        },
+                        (0b0000000, 0b001) => {
+                            // SLLW: Shift-left logical
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                {load_rcx_from_rs2}
+                                shl eax, cl
+                                movsx rax, eax
+                                {store_rax_into_rd}
+                                "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rcx_from_rs2 = load_reg!("rcx", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"));
+                        },
+                        (0b0000000, 0b101) => {
+                            // SRLW: Shift-right locical
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                {load_rcx_from_rs2}
+                                shr eax, cl
+                                movsx rax, eax
+                                {store_rax_into_rd}
+                                "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rcx_from_rs2 = load_reg!("rcx", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"));
+                        },
+                        (0b0100000, 0b101) => {
+                            // SRAW: Shift-right arith.
+                            asm += &format!(r#"
+                                {load_rax_from_rs1}
+                                {load_rcx_from_rs2}
+                                sar eax, cl
+                                movsx rax, eax
+                                {store_rax_into_rd}
+                                "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rcx_from_rs2 = load_reg!("rcx", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"));
+                        }
+                        _ => {panic!(
+                                "Unknown (funct7, funct3): ({:#07b}, {:#03b}) in opcode: {:#09b}\n",
+                                inst.funct7, inst.funct3, opcode)},
+                    }
+                },
+
+                0b0001111 => {
+                    let inst = Itype::from(inst);
+                    match inst.funct3 {
+                        0b000 => {
+                            //FENCE
+                        }
+                        _ => unreachable!(),
+                    }
+                },
+                0b1110011 => {
+                    if        inst == 0b00000000000000000000000001110011 {
+                        // ECALL
+                        asm += &format!(r#"
+                            mov rax, 2
+                            mov rdx, {pc}
+                            ret
+                        "#, pc = pc.wrapping_add(4));
+                    } else if inst == 0b00000000000100000000000001110011 {
+                        // EBREAK
+                        asm += &format!(r#"
+                            mov rax, 3
+                            mov rdx, {pc}
+                            ret
+                        "#, pc = pc);
+                    } else {
+                        unreachable!();
+                    }
+                },
+
+                _ => {panic!("Unknown opcode: {:#09b}\n", opcode)},
+            }
+
+            // Update the program counter to the next instruction
+            pc += 4;
+        }
+        // Return the assembly we generated.
+        Ok(asm)
+    }
 }
 
 impl Arch for RiscV {
@@ -286,7 +956,7 @@ impl Arch for RiscV {
                         self.set_register(Register::Pc, target);
                         return Ok(());
                     },
-                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
+                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n",
                                  inst.funct3, opcode)},
                 }
             },
@@ -302,7 +972,7 @@ impl Arch for RiscV {
                     0b000 => {
                         // BEQ: Branch if EQual
                         if rs1 == rs2 {
-                            self.set_register(Register::Pc, 
+                            self.set_register(Register::Pc,
                                               pc.wrapping_add(inst.imm as i64 as u64));
                             return Ok(());
                         }
@@ -310,7 +980,7 @@ impl Arch for RiscV {
                     0b001 => {
                         // BNQ: Branch if Not eQual
                         if rs1 != rs2 {
-                            self.set_register(Register::Pc, 
+                            self.set_register(Register::Pc,
                                               pc.wrapping_add(inst.imm as i64 as u64));
                             return Ok(());
                         }
@@ -318,7 +988,7 @@ impl Arch for RiscV {
                     0b100 => {
                         // BLT: Branch if less than
                         if (rs1 as i64) < (rs2 as i64) {
-                            self.set_register(Register::Pc, 
+                            self.set_register(Register::Pc,
                                               pc.wrapping_add(inst.imm as i64 as u64));
                             return Ok(());
                         }
@@ -326,7 +996,7 @@ impl Arch for RiscV {
                     0b101 => {
                         // BGE: Branch if greater of equal
                         if rs1 as i64 >= rs2 as i64 {
-                            self.set_register(Register::Pc, 
+                            self.set_register(Register::Pc,
                                               pc.wrapping_add(inst.imm as i64 as u64));
                             return Ok(());
                         }
@@ -334,7 +1004,7 @@ impl Arch for RiscV {
                     0b110 => {
                         // BLTU: Branch if less than (unsigned version)
                         if (rs1 as u64) < (rs2 as u64) {
-                            self.set_register(Register::Pc, 
+                            self.set_register(Register::Pc,
                                               pc.wrapping_add(inst.imm as i64 as u64));
                             return Ok(());
                         }
@@ -342,7 +1012,7 @@ impl Arch for RiscV {
                     0b111 => {
                         // BGEU: Branch if greater than or equal (unsigned version)
                         if (rs1 as u64) >= (rs2 as u64) {
-                            self.set_register(Register::Pc, 
+                            self.set_register(Register::Pc,
                                               pc.wrapping_add(inst.imm as i64 as u64));
                             return Ok(());
                         }
@@ -396,7 +1066,7 @@ impl Arch for RiscV {
                         let val = mmu_read!(mmu, addr, i64)?;
                         self.set_register(inst.rd, val as u64);
                     },
-                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
+                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n",
                                  inst.funct3, opcode)},
                 }
             },
@@ -428,7 +1098,7 @@ impl Arch for RiscV {
                         let val = self.get_register(inst.rs2) as u64;
                         mmu_write!(mmu, addr, val)?;
                     },
-                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
+                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n",
                                  inst.funct3, opcode)},
                 }
             },
@@ -499,7 +1169,7 @@ impl Arch for RiscV {
 
                         }
                     },
-                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
+                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n",
                                  inst.funct3, opcode)},
                 }
             },
@@ -564,7 +1234,7 @@ impl Arch for RiscV {
                         self.set_register(inst.rd, rs1 & rs2);
                     },
                     _ => {panic!(
-                            "Unknown (funct7, funct3): ({:#07b}, {:#03b}) in opcode: {:#09b}\n", 
+                            "Unknown (funct7, funct3): ({:#07b}, {:#03b}) in opcode: {:#09b}\n",
                             inst.funct7, inst.funct3, opcode)},
                 }
             },
@@ -605,7 +1275,7 @@ impl Arch for RiscV {
                             _ => panic!("Unknown shift mode in opcode {:#09b}\n", opcode),
                         };
                     },
-                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
+                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n",
                                  inst.funct3, opcode)},
                 }
             },
@@ -642,7 +1312,7 @@ impl Arch for RiscV {
                         self.set_register(inst.rd, ((rs1 as i32) >> shamt) as i64 as u64);
                     }
                     _ => {panic!(
-                            "Unknown (funct7, funct3): ({:#07b}, {:#03b}) in opcode: {:#09b}\n", 
+                            "Unknown (funct7, funct3): ({:#07b}, {:#03b}) in opcode: {:#09b}\n",
                             inst.funct7, inst.funct3, opcode)},
                 }
             },
@@ -673,6 +1343,85 @@ impl Arch for RiscV {
         // Update the program counter to the next instruction
         self.set_register(Register::Pc, pc.wrapping_add(4));
         Ok(())
+    }
+
+
+    // TODO; Non of this is particularly Arch-specific, so it can be moved to emu / jitcache
+    fn run_jit(&mut self, mmu: &mut Mmu, file_pool: &mut FilePool,
+               jit_cache: &Arc<JitCache>) -> Result<(), VmExit> {
+
+        loop {
+            let pc       = self.get_register(Register::Pc);
+            let jit_addr = jit_cache.lookup(VirtAddr(pc as usize));
+
+            // Get the addresses we need to run the JIT:
+            let (mem, perms, dirty, dirty_bitmap) = mmu.jit_addresses();
+            let translation_table = jit_cache.translation_table();
+
+            let jit_addr = match jit_addr {
+                None => {
+                    // Go through each instruction in the block to emit some x86_64 assembly
+                    let asm = self.generate_jit(VirtAddr(pc as usize),
+                                                jit_cache.num_blocks(), mmu)?;
+
+                    // Write the assembly to a temp file
+                    let asmfn =std::env::temp_dir().join("tmp.asm");
+                    std::fs::write(&asmfn, &asm).expect("Failed to drop ASM to disk");
+                    let nasm_res = Command::new("nasm").args(&["-f", "bin", "-o", "jit_tmp/jit",
+                                                asmfn.to_str().unwrap()]).status()
+                        .expect("Failed to run `nasm`, is it in your PATH?");
+
+                    // Read the binary that nasm just generated for us.
+                    let tmp = std::fs::read("jit_tmp/jit").expect("Failed to read NASM output.");
+
+                    // Add the fresh JIT code to the mapping.
+                    jit_cache.add_mapping(VirtAddr(pc as usize), &tmp)
+                },
+                Some(jit_addr) => jit_addr,
+            };
+
+
+            unsafe {
+
+                let exit_code: u64;
+                let reentry  : u64;
+                // Hop into the JIT
+                asm!(r#"
+                   call {entry}
+                "#,
+                entry = in(reg) jit_addr,
+                in("r8")  mem,
+                in("r9")  perms,
+                in("r10") dirty,
+                in("r11") dirty_bitmap,
+                in("r12") 0u64,
+                in("r13") self.registers.as_ptr(),
+                in("r14") translation_table,
+                // Let rust known what we potentially clobbered.
+                out("rax") exit_code,
+                out("rdx") reentry,
+                out("rcx") _,
+                );
+
+                // DEBUG
+                //println!("JIT exited with {:#x}, reentry: {:#x}", exit_code, reentry);
+                match exit_code {
+                    1 => {
+                        // Branch decode request, update PC and re-JIT
+                        self.set_register(Register::Pc, reentry)
+                    },
+                    2 => {
+                        // JIT encountered a syscall. Handle it and reenter.
+                        // (We need to set PC first, so a syscall can potentially set PC as well,
+                        //  like `sigreturn` for example.)
+                        self.set_register(Register::Pc, reentry);
+                        self.handle_syscall(mmu, file_pool)?;
+                    },
+                    x => unimplemented!("JIT Exit code not handled: {}.", x),
+                }
+            }
+        }
+       // Err(VmExit::Exit(-1))
     }
 }
 
@@ -783,7 +1532,7 @@ impl From<u32> for Stype {
         let imm = ((imm as i32) << 20) >> 20;
 
         Stype {
-            imm   : imm, 
+            imm   : imm,
             rs1   : Register::from_u32((inst >> 15) & 0b11111).unwrap(),
             rs2   : Register::from_u32((inst >> 20) & 0b11111).unwrap(),
             funct3: (inst >> 12) & 0b111,

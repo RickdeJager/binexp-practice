@@ -141,6 +141,21 @@ impl Mmu {
         self.dirty.clear();
     }
 
+    /// Getter function to get all pointers required to run the JIT:
+    /// - memory pointer
+    /// - permissions pointer
+    /// - dirty pointer
+    /// - dirty bitmap pointer
+    #[inline]
+    pub fn jit_addresses(&self) -> (usize, usize, usize, usize) {
+        (
+            self.memory.as_ptr() as usize,
+            self.permissions.as_ptr() as usize,
+            self.dirty.as_ptr() as usize,
+            self.dirty_bitmap.as_ptr() as usize,
+        )
+    }
+
     /// Allocate a region of memory as RW.
     pub fn allocate(&mut self, size: usize) -> Option<VirtAddr> {
 
@@ -156,7 +171,9 @@ impl Mmu {
         }
 
         // Mark the new memory as uninitialized and writable.
-        self.set_permissions(base, size, Perm(PERM_RAW | PERM_WRITE));
+        // TODO;
+        //self.set_permissions(base, size, Perm(PERM_RAW | PERM_WRITE));
+        self.set_permissions(base, size, Perm(PERM_READ | PERM_WRITE));
 
         Some(base)
     }
@@ -228,8 +245,8 @@ impl Mmu {
 
         for block in block_start..=block_end {
             // Determine the bitmap position of the dirty block
-            let idx = block_start / 64;
-            let bit = block_start % 64;
+            let idx = block / 64;
+            let bit = block % 64;
 
             // Check if the block is not dirty
             if self.dirty_bitmap[idx] & (1 << bit) == 0 {
