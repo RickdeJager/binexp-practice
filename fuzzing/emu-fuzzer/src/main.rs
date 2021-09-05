@@ -1,4 +1,4 @@
-#![feature(asm)]
+#![feature(asm, thread_id_value)]
 #[macro_use]
 // MMU defines macro's for reading/writing integer types, so must be pulled in
 // before any other modules are pulled in.
@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 
-pub const ALLOW_GUEST_PRINT: bool = true;
+pub const ALLOW_GUEST_PRINT: bool = false;
 pub const ONE_SHOT: bool = false;
 
 // I/O settings
@@ -30,10 +30,10 @@ pub const TEST_FILE : &str = "testfile";
 
 // Statistics
 const BATCH_SIZE: usize = 50;
-const NUM_THREADS: usize = 1;
+const NUM_THREADS: usize = 8;
 
 // Fuzzy tweakables
-const CORRUPTION_AMOUNT: usize = 0;
+const CORRUPTION_AMOUNT: usize = 60;
 
 pub struct Rng(u64);
 
@@ -151,13 +151,7 @@ fn main() {
 
     // Pre-run the template emulator until the first `open` call
     // TODO; * manually obj-dumped for now
-    //golden_emu.run_until(0x9b19c).expect("Failed to pre-run the golden-emu.");
-
-    println!(">>>>>>>>> {:?}", golden_emu.run());
-
-    unreachable!("Noice");
-
-
+    golden_emu.run_until(0x9b19c).expect("Failed to pre-run the golden-emu.");
 
     // Keep track of all threads
     let mut threads = Vec::new();
@@ -218,7 +212,9 @@ fn worker(golden_emu: Arc<Emulator>, thread_id: usize, stats: Arc<Stats>) {
             mut_cycles += util::rdtsc() - it;
             
             let it = util::rdtsc();
-            let ret = emu.run_until(0x185a4).unwrap();
+            //let ret = emu.run_until(0x185a4).unwrap();
+            let ret = emu.run();
+            //let ret = emu.run_emu();
             vm_cycles += util::rdtsc() - it;
 
             instructions += ret.0;

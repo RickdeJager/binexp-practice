@@ -10,7 +10,8 @@ pub const PERM_RAW  : u8 = 1 << 3;
 /// perf for your specific target.
 /// Setting this to a larger value causes fewer, large memcpy's to occur, setting
 /// this to a lower value causes more, smaller memcpy's to occur.
-const DIRTY_BLOCK_SIZE: usize = 128;
+/// (For JIT reasons, this is required to be a power of 2, and greater than 8)
+pub const DIRTY_BLOCK_SIZE: usize = 0x100;
 
 /// Small little helper macro to get type lengths at compile time
 macro_rules! get_type_len {
@@ -94,6 +95,12 @@ pub struct Mmu {
 impl Mmu {
     /// Create a new memory space of size `size`
     pub fn new(size: usize) -> Self {
+
+        // In our JIT, we make some assumptions on the dirty block size. To keep things simple,
+        // we'll just make this a general requirement, even if running in interpreted mode.
+        assert!(DIRTY_BLOCK_SIZE.count_ones() == 1 && DIRTY_BLOCK_SIZE >= 8,
+                "Dirty block size must be a power of two and >= 8");
+
         Mmu {
             memory        : vec![0; size],
             permissions   : vec![Perm(0); size],
@@ -154,6 +161,27 @@ impl Mmu {
             self.dirty.as_ptr() as usize,
             self.dirty_bitmap.as_ptr() as usize,
         )
+    }
+
+    /// Get the dirty list length
+    #[inline]
+    pub fn dirty_len(&self) -> usize {
+        self.dirty.len()
+    }
+
+    /// Set the dirty list length.
+    /// Used to forcefully update the vec size, after we added some data to the backing store
+    /// from within the JIT. This is only allowed because we reserved enough space in the vector
+    /// to hold all possible dirty blocks, otherwise this would go OOB.
+    #[inline]
+    pub unsafe fn set_dirty_len(&mut self, len: usize) {
+        self.dirty.set_len(len);
+    }
+
+    /// Get the length of the memory vec.
+    #[inline]
+    pub fn mem_len(&self) -> usize {
+        self.memory.len()
     }
 
     /// Allocate a region of memory as RW.

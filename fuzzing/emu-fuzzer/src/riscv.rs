@@ -1,8 +1,6 @@
-#[allow(dead_code)]
-
 use crate::emu::{Arch, PreArch, VmExit};
 use crate::mmu::{Mmu, Perm, VirtAddr};
-use crate::mmu::{PERM_READ, PERM_EXEC};
+use crate::mmu::{PERM_READ, PERM_EXEC, DIRTY_BLOCK_SIZE};
 
 use crate::syscall;
 use crate::files::FilePool;
@@ -388,24 +386,41 @@ impl RiscV {
                     // LX: Load instructions
                     let inst = Itype::from(inst);
 
-                    let (load_type, load_size, reg) = match inst.funct3 {
-                        0b000 => ("movsx", "byte",  "rax"),    // LB : Load byte
-                        0b001 => ("movsx", "word",  "rax"),    // LH : Load half word
-                        0b010 => ("movsx", "dword", "rax"),    // LW : Load word
-                        0b011 => ("mov",   "qword", "rax"),    // LD : Load double word
-                        0b100 => ("movzx", "byte",  "rax"),    // LBU: Load byte unsigned.
-                        0b101 => ("movzx", "word",  "rax"),    // LHU: Load half word unsigned
-                        0b110 => ("mov",   "dword", "eax"),    // LWU: Load word unsigned
+                    let (load_type, load_size, reg, size) = match inst.funct3 {
+                        0b000 => ("movsx", "byte",  "rax", 1),    // LB : Load byte
+                        0b001 => ("movsx", "word",  "rax", 2),    // LH : Load half word
+                        0b010 => ("movsx", "dword", "rax", 4),    // LW : Load word
+                        0b011 => ("mov",   "qword", "rax", 8),    // LD : Load double word
+                        0b100 => ("movzx", "byte",  "rax", 1),    // LBU: Load byte unsigned.
+                        0b101 => ("movzx", "word",  "rax", 2),    // LHU: Load half word unsigned
+                        0b110 => ("mov",   "dword", "eax", 4),    // LWU: Load word unsigned
                         _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
                                      inst.funct3, opcode)},
                     };
 
                     asm += &format!(r#"
                         {load_rax_from_rs1}
-                        {load_type} {reg}, {load_size} [r8 + rax + {imm}]
+                        add rax, {imm}
+
+                        ; Bounds check first
+                        cmp rax, {memory_len} - {size}
+                        ja .fault
+
+                        ; TODO; Perms check here
+                        jmp .do_load
+
+                        .fault:
+                        mov rcx, rax
+                        mov rdx, {pc}
+                        mov rax, 4
+                        ret
+                        
+                        .do_load:
+                        {load_type} {reg}, {load_size} [r8 + rax]
                         {store_rax_into_rd}
                     "#, imm = inst.imm,
                         load_type = load_type, load_size = load_size, reg = reg,
+                        memory_len = mmu.mem_len(), size = size, pc = pc,
                         load_rax_from_rs1 = load_reg!("rax", inst.rs1),
                         store_rax_into_rd = store_reg!(inst.rd, "rax"));
                 },
@@ -413,21 +428,56 @@ impl RiscV {
                     // SX: Store instructions
                     let inst = Stype::from(inst);
 
-                    let (store_type, store_size, reg) = match inst.funct3 {
-                        0b000 => ("mov", "byte",  "dl" ),    // SB : Store byte
-                        0b001 => ("mov", "word",  "dx" ),    // SH : Store half word
-                        0b010 => ("mov", "dword", "edx"),    // SW : Store word
-                        0b011 => ("mov", "qword", "rdx"),    // SD : Store double word
+                    // Beyond resolving the right mnemonics, we also need to know the size of the
+                    // write so we can do perm tracking and make sure the dirtied bytes are
+                    // registerd correctly.
+                    let (store_type, store_size, reg, size) = match inst.funct3 {
+                        0b000 => ("mov", "byte",  "dl",  1),    // SB : Store byte
+                        0b001 => ("mov", "word",  "dx",  2),    // SH : Store half word
+                        0b010 => ("mov", "dword", "edx", 4),    // SW : Store word
+                        0b011 => ("mov", "qword", "rdx", 8),    // SD : Store double word
                         _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
                                      inst.funct3, opcode)},
                     };
 
+                    // DIRTY_BLOCK_SIZE is required to be a power of 2, wich means we can just
+                    // shift an address down by `shamt` to get the block idx.
+                    let dirty_block_shamt = DIRTY_BLOCK_SIZE.trailing_zeros();
+
                     asm += &format!(r#"
                         {load_rax_from_rs1}
                         {load_rdx_from_rs2}
+
+                        ; Bounds check first
+                        cmp rax, {memory_len} - {size}
+                        ja .fault
+
+                        ; TODO; Perms check here
+                        jmp .nofault
+
+                        .fault:
+                        mov rcx, rax
+                        mov rdx, {pc}
+                        mov rax, 5
+                        ret
+
+                        .nofault:
+                        ; Check if this block is already marked dirty (if not, set it)
+                        mov rcx, rax
+                        shr rcx, {dirty_block_shamt}
+                        bts qword [r11], rcx
+                        jc .do_store
+
+                        ; The block wasn't marked dirty yet, add its index to the dirty list.
+                        mov qword[r10 + r12*8], rcx
+                        inc r12
+                        
+                        .do_store:
                         {store_type} {store_size} [r8 + rax + {imm}], {reg}
                     "#, imm = inst.imm,
+                        dirty_block_shamt = dirty_block_shamt,
                         store_type = store_type, store_size = store_size, reg = reg,
+                        memory_len = mmu.mem_len(), size = size, pc = pc,
                         load_rax_from_rs1 = load_reg!("rax", inst.rs1),
                         load_rdx_from_rs2 = load_reg!("rdx", inst.rs2));
                  },
@@ -1350,6 +1400,11 @@ impl Arch for RiscV {
     fn run_jit(&mut self, mmu: &mut Mmu, file_pool: &mut FilePool,
                jit_cache: &Arc<JitCache>) -> Result<(), VmExit> {
 
+        // use a temp directory to assemble in.
+        let tmpdir = std::env::temp_dir().join("fuzzy");
+        std::fs::create_dir_all(&tmpdir).expect("Failed to create tmp dir for JIT cache");
+        let thread_id = std::thread::current().id().as_u64();
+
         loop {
             let pc       = self.get_register(Register::Pc);
             let jit_addr = jit_cache.lookup(VirtAddr(pc as usize));
@@ -1364,15 +1419,17 @@ impl Arch for RiscV {
                     let asm = self.generate_jit(VirtAddr(pc as usize),
                                                 jit_cache.num_blocks(), mmu)?;
 
-                    // Write the assembly to a temp file
-                    let asmfn =std::env::temp_dir().join("tmp.asm");
+                    let asmfn = tmpdir.join(&format!("tmp-{}.asm", thread_id));
+                    let binfn = tmpdir.join(&format!("tmp-{}.bin", thread_id));
                     std::fs::write(&asmfn, &asm).expect("Failed to drop ASM to disk");
-                    let nasm_res = Command::new("nasm").args(&["-f", "bin", "-o", "jit_tmp/jit",
-                                                asmfn.to_str().unwrap()]).status()
+                    let nasm_res = Command::new("nasm")
+                        .args(&["-f", "bin", "-o", binfn.to_str().unwrap(),
+                                asmfn.to_str().unwrap()])
+                        .status()
                         .expect("Failed to run `nasm`, is it in your PATH?");
 
                     // Read the binary that nasm just generated for us.
-                    let tmp = std::fs::read("jit_tmp/jit").expect("Failed to read NASM output.");
+                    let tmp = std::fs::read(binfn).expect("Failed to read NASM output.");
 
                     // Add the fresh JIT code to the mapping.
                     jit_cache.add_mapping(VirtAddr(pc as usize), &tmp)
@@ -1380,11 +1437,13 @@ impl Arch for RiscV {
                 Some(jit_addr) => jit_addr,
             };
 
+            let mut num_dirty_inuse = mmu.dirty_len();
+            let exit_code    : u64;
+            let reentry      : u64;
+            let guest_address: u64;
 
             unsafe {
 
-                let exit_code: u64;
-                let reentry  : u64;
                 // Hop into the JIT
                 asm!(r#"
                    call {entry}
@@ -1394,31 +1453,55 @@ impl Arch for RiscV {
                 in("r9")  perms,
                 in("r10") dirty,
                 in("r11") dirty_bitmap,
-                in("r12") 0u64,
+                inout("r12") num_dirty_inuse,
                 in("r13") self.registers.as_ptr(),
                 in("r14") translation_table,
                 // Let rust known what we potentially clobbered.
                 out("rax") exit_code,
                 out("rdx") reentry,
-                out("rcx") _,
+                out("rcx") guest_address, // Contains the offending address for read/write faults
                 );
 
-                // DEBUG
-                //println!("JIT exited with {:#x}, reentry: {:#x}", exit_code, reentry);
-                match exit_code {
-                    1 => {
-                        // Branch decode request, update PC and re-JIT
-                        self.set_register(Register::Pc, reentry)
-                    },
-                    2 => {
-                        // JIT encountered a syscall. Handle it and reenter.
-                        // (We need to set PC first, so a syscall can potentially set PC as well,
-                        //  like `sigreturn` for example.)
-                        self.set_register(Register::Pc, reentry);
-                        self.handle_syscall(mmu, file_pool)?;
-                    },
-                    x => unimplemented!("JIT Exit code not handled: {}.", x),
-                }
+                // Update the length of the dirty list, since we potentially added some items
+                // to its backing store.
+                mmu.set_dirty_len(num_dirty_inuse);
+            }
+
+            // DEBUG
+            //println!("JIT exited with {:#x}, reentry: {:#x}", exit_code, reentry);
+            match exit_code {
+                1 => {
+                    // Branch decode request, update PC and re-JIT
+                    self.set_register(Register::Pc, reentry)
+                },
+                2 => {
+                    // JIT encountered a syscall. Handle it and reenter.
+                    // (We need to set PC first, so a syscall can potentially set PC as well,
+                    //  like `sigreturn` for example.)
+                    self.set_register(Register::Pc, reentry);
+                    self.handle_syscall(mmu, file_pool)?;
+                },
+                4 => {
+                    // JIT encountered a read fault, let the fuzzer known we crashed.
+                   // TODO; 
+                   // - We don't currently pass the read size. Assuming 1 for now
+                   // - The crash_handler will request pc to dedupe crashes, which will be
+                   //   slightly off, due to lazy updating.
+                   //   Setting it here is a bit hacky
+                   self.set_register(Register::Pc, reentry);
+                   return Err(VmExit::ReadFault(VirtAddr(guest_address as usize), 1))
+                },
+                5 => {
+                    // JIT encountered a write fault, let the fuzzer known we crashed.
+                   // TODO; 
+                   // - We don't currently pass the read size. Assuming 1 for now
+                   // - The crash_handler will request pc to dedupe crashes, which will be
+                   //   slightly off, due to lazy updating.
+                   //   Setting it here is a bit hacky
+                   self.set_register(Register::Pc, reentry);
+                   return Err(VmExit::ReadFault(VirtAddr(guest_address as usize), 1))
+                },
+                x => unimplemented!("JIT Exit code not handled: {}.", x),
             }
         }
        // Err(VmExit::Exit(-1))
