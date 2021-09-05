@@ -4,6 +4,8 @@ use crate::jitcache::JitCache;
 use crate::files::FilePool;
 
 use std::sync::Arc;
+use std::process::Command;
+use std::collections::BTreeMap;
 
 #[repr(u8)]
 pub enum Archs {
@@ -16,20 +18,24 @@ pub trait PreArch: Arch {
 
 pub trait Arch {
 
-    fn tick(&mut self, mmu: &mut Mmu, file_pool: &mut FilePool) -> Result<(), VmExit>;
+    fn tick(&mut self, mmu: &mut Mmu, file_pool: &mut FilePool, break_map: &BreakpointMap)
+        -> Result<(), VmExit>;
     fn get_register_raw(&self, reg: usize) -> Option<u64>;
     fn set_register_raw(&mut self, reg: usize, value: u64) -> Option<()>;
-    fn set_entry(&mut self, value: u64);
     fn set_stackp(&mut self, value: u64);
 
     fn get_register_state(&self) -> &[u64];
+    fn get_register_pointer(&self) -> usize;
     fn set_register_state(&mut self, new_regs: &[u64]) -> Option<()>;
     fn get_program_counter(&self) -> u64;
+    fn set_program_counter(&mut self, value: u64);
 
     fn fork(&self) -> Box<dyn Arch + Send + Sync>;
 
-    fn run_jit(&mut self, mmu: &mut Mmu, file_pool: &mut FilePool, jit_cache: &Arc<JitCache>)
-        -> Result<(), VmExit>;
+    fn generate_jit(&mut self, pc: VirtAddr, num_blocks: usize, mmu: &mut Mmu, 
+                    break_map: &BreakpointMap) -> Result<String, VmExit>;
+
+    fn handle_syscall(&mut self, mmu: &mut Mmu, file_pool: &mut FilePool) -> Result<(), VmExit>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -37,6 +43,13 @@ pub enum VmExit {
 
     /// Clean exit, as requested by the Guest.
     Exit(i64),
+
+    /// We reached the end of whatever critical function we're targetting, we can reset here.
+    EndOfFuzzCase,
+
+    /// We're exiting for some unspecified reason related to the emulators execution, rather
+    /// than guest behaviour.
+    Meta,
 
     /// Calling this Syscall would trigger an integer overflow.
     SyscallIntegerOverflow,
@@ -109,6 +122,11 @@ impl From<VirtAddr> for VirtAddrType {
     }
 }
 
+
+pub type BreakpointMap = BTreeMap<VirtAddr, BreakpointCallback>;
+/// Callback for breakpoints
+type BreakpointCallback = fn(&mut Mmu) -> Result<(), VmExit>;
+
 pub struct Emulator {
     /// The architecture struct that this emu will exec.
     pub arch: Box<dyn Arch + Send + Sync>,
@@ -121,6 +139,16 @@ pub struct Emulator {
 
     /// (Optional) Reference to shared JIT cache
     pub jit_cache: Option<Arc<JitCache>>,
+
+    /// a Map of breakpoints, keyed by address, containing callback functions to execute when hit
+    breakpoints: BreakpointMap,
+}
+
+/// Callback functions
+/// End the fuzz case, and return some perf counters.
+fn end_of_fuzz_case(_: &mut Mmu) -> Result<(), VmExit> {
+    // TODO; Return instr exec'd
+    Err(VmExit::EndOfFuzzCase)
 }
 
 impl Emulator {
@@ -129,15 +157,17 @@ impl Emulator {
         match chosen_arch {
             Archs::RiscV => {
                 Emulator{
-                    arch     : riscv::RiscV::new(),
-                    mmu      : mem,
-                    file_pool: file_pool,
-                    jit_cache: None,
+                    arch       : riscv::RiscV::new(),
+                    mmu        : mem,
+                    file_pool  : file_pool,
+                    jit_cache  : None,
+                    breakpoints: BTreeMap::new(),
                 }
             },
         }
     }
 
+    /// Add a jitcache and enable JIT for this emu (assuming the arch supports it)
     pub fn add_jitcache(&mut self, jit_cache: Arc<JitCache>) {
         self.jit_cache = Some(jit_cache);
     }
@@ -145,10 +175,11 @@ impl Emulator {
     /// Fork the current emulator.
     pub fn fork(&self) -> Self {
         Emulator {
-            arch     : self.arch.fork(),
-            mmu      : self.mmu.fork(),
-            file_pool: self.file_pool.clone(),
-            jit_cache: self.jit_cache.clone(),
+            arch       : self.arch.fork(),
+            mmu        : self.mmu.fork(),
+            file_pool  : self.file_pool.clone(),
+            jit_cache  : self.jit_cache.clone(),
+            breakpoints: self.breakpoints.clone(),
         }
     }
 
@@ -162,7 +193,7 @@ impl Emulator {
 
     /// Set the entry point of the emulator.
     pub fn set_entry(&mut self, entry: u64) {
-        self.arch.set_entry(entry);
+        self.arch.set_program_counter(entry);
     }
 
     /// Set the stack pointer.
@@ -172,7 +203,7 @@ impl Emulator {
 
     /// Helper function to tick the emu.
     fn tick(&mut self) -> Result<(), VmExit> {
-        self.arch.tick(&mut self.mmu, &mut self.file_pool)
+        self.arch.tick(&mut self.mmu, &mut self.file_pool, &self.breakpoints)
     }
 
     /// Run using either the emu, or a JIT-enabled variant
@@ -183,9 +214,12 @@ impl Emulator {
         }
     }
 
-    /// Run the emulator until it either crashes or exits.
+
+
+    /// Small helper function to keep the interfacte for run_jit equal to run_emu.
+    /// TODO; probably will restructure this later
     pub fn run_jit(&mut self) -> (usize, VmExit) {
-        let ret = self.arch.run_jit(&mut self.mmu, &mut self.file_pool, self.jit_cache.as_ref().unwrap());
+        let ret = self.do_run_jit();
 
         if let Err(e) = ret{
             return (0, e)
@@ -207,20 +241,176 @@ impl Emulator {
         unreachable!();
     }
 
-    /// Run the emulator until a certain instruction. Returns before the instruction
-    /// is executed.
-    pub fn run_until(&mut self, inst: u64) -> Option<(usize, VmExit)> {
+    /// Single step forwards until the emulator is sat at the required instruction.
+    pub fn step_until(&mut self, addr: VirtAddr) -> Option<(usize, VmExit)> {
         loop {
-            let pc = self.arch.get_program_counter();
-            //self.tick().ok()?;
-            if let Err(e) = self.tick() {
-                return Some((pc as usize, e))
+            let pc = self.arch.get_program_counter() as usize;
+            if pc == addr.0 {
+                break Some((pc, VmExit::Meta))
             }
-            if self.arch.get_program_counter() == inst {
-                //break Some(())
-                break Some((inst as usize, VmExit::Exit(0)))
+            if let Err(e) = self.tick() {
+                break Some((pc, e))
             }
         }
     }
+
+    /// Specify an address where we want to end this fuzz case.
+    pub fn set_end_of_fuzz_case(&mut self, addr: VirtAddr) {
+        assert!(self.breakpoints.insert(addr, end_of_fuzz_case).is_none());
+    }
+
+    /// This functions keeps the JIT choochin' by invoking nasm when needed, and handling
+    /// JIT exit's appropriately.
+    ///
+    /// Returns an Err(VmExit) either due to crash or completion.
+    fn do_run_jit(&mut self) -> Result<(), VmExit> {
+
+        let mmu       = &mut self.mmu;
+        let file_pool = &mut self.file_pool;
+        let jit_cache = self.jit_cache.as_ref().unwrap();
+
+        // Allow the JIT entry point to be overwritten. This is useful for breakpoint / callback
+        // handling. This will point to a specific address in host memory.
+        let mut overwrite_jit_address: Option<usize> = None;
+
+        // use a temp directory to assemble in.
+        let tmpdir = std::env::temp_dir().join("fuzzy");
+        std::fs::create_dir_all(&tmpdir).expect("Failed to create tmp dir for JIT cache");
+        let thread_id = std::thread::current().id().as_u64();
+
+        loop {
+            let pc       = self.arch.get_program_counter();
+            let jit_addr = jit_cache.lookup(VirtAddr(pc as usize));
+
+            // Get the addresses we need to run the JIT:
+            let (mem, perms, dirty, dirty_bitmap) = mmu.jit_addresses();
+            let translation_table = jit_cache.translation_table();
+
+            
+            let jit_addr = match (jit_addr, overwrite_jit_address) {
+                // If the address is not already in jitcache, and we don't have an overwrite, we
+                // have to generate some new assembly and JIT it.
+                (None, None) => {
+                    // Go through each instruction in the block to emit some x86_64 assembly
+                    let asm = self.arch.generate_jit(VirtAddr(pc as usize),
+                                                jit_cache.num_blocks(), mmu, &self.breakpoints)?;
+
+                    let asmfn = tmpdir.join(&format!("tmp-{}.asm", thread_id));
+                    let binfn = tmpdir.join(&format!("tmp-{}.bin", thread_id));
+                    std::fs::write(&asmfn, &asm).expect("Failed to drop ASM to disk");
+                    let _nasm_res = Command::new("nasm")
+                        .args(&["-f", "bin", "-o", binfn.to_str().unwrap(),
+                                asmfn.to_str().unwrap()])
+                        .status()
+                        .expect("Failed to run `nasm`, is it in your PATH?");
+
+                    // Read the binary that nasm just generated for us.
+                    let tmp = std::fs::read(binfn).expect("Failed to read NASM output.");
+
+                    // Add the fresh JIT code to the mapping.
+                    jit_cache.add_mapping(VirtAddr(pc as usize), &tmp)
+                },
+
+                // If we already have JIT cache for our destination, and we don't have an overwrite
+                // set, we can just return the cached location.
+                (Some(jit_addr), None) => {
+                    jit_addr
+                },
+
+                // If we have an overwrite_jit_address set, ignore whatever jit_addr is, and force
+                // the return value to be the overwrite address.
+                (_, Some(new_addr)) => {
+                    // Clear out the overwrite, so subsequent runs will resolve a proper address.
+                    overwrite_jit_address = None;
+                    new_addr
+                },
+            };
+
+            let mut num_dirty_inuse = mmu.dirty_len();
+            let exit_code: u64;
+            let reentry  : u64;
+            let arg1     : u64;
+
+            unsafe {
+
+                // Hop into the JIT
+                asm!(r#"
+                   call {entry}
+                "#,
+                entry = in(reg) jit_addr,
+                in("r8")  mem,
+                in("r9")  perms,
+                in("r10") dirty,
+                in("r11") dirty_bitmap,
+                inout("r12") num_dirty_inuse,
+                in("r13") self.arch.get_register_pointer(),
+                in("r14") translation_table,
+                // Let rust known what we potentially clobbered.
+                out("rax") exit_code,
+                out("rdx") reentry,
+                out("rcx") arg1,
+                );
+
+                // Update the length of the dirty list, since we potentially added some items
+                // to its backing store.
+                mmu.set_dirty_len(num_dirty_inuse);
+            }
+
+            // DEBUG
+            //println!("JIT exited with {:#x}, reentry: {:#x}", exit_code, reentry);
+            match exit_code {
+                1 => {
+                    // Branch decode request, update PC and re-JIT
+                    self.arch.set_program_counter(reentry)
+                },
+                2 => {
+                    // JIT encountered a syscall. Handle it and reenter.
+                    // (We need to set PC first, so a syscall can potentially set PC as well,
+                    //  like `sigreturn` for example.)
+                    self.arch.set_program_counter(reentry);
+                    self.arch.handle_syscall(mmu, file_pool)?;
+                },
+                4 => {
+                   // JIT encountered a read fault, let the fuzzer known we crashed.
+                   // TODO; 
+                   // - We don't currently pass the read size. Assuming 1 for now
+                   // - The crash_handler will request pc to dedupe crashes, which will be
+                   //   slightly off, due to lazy updating.
+                   //   Setting it here is a bit hacky
+                   //
+                   //   Arg1 contains the offending address
+                   self.arch.set_program_counter(reentry);
+                   return Err(VmExit::ReadFault(VirtAddr(arg1 as usize), 1))
+                },
+                5 => {
+                   // JIT encountered a write fault, let the fuzzer known we crashed.
+                   // TODO; 
+                   // - We don't currently pass the read size. Assuming 1 for now
+                   // - The crash_handler will request pc to dedupe crashes, which will be
+                   //   slightly off, due to lazy updating.
+                   //   Setting it here is a bit hacky
+                   //
+                   //   Arg1 contains the offending address
+                   self.arch.set_program_counter(reentry);
+                   return Err(VmExit::ReadFault(VirtAddr(arg1 as usize), 1))
+                },
+                6 => {
+                    // JIT encountered a breakpoint, probably because we injected one.'
+                    // Check if the breakpoint is one of ours, and if so handle the callback.
+                    if let Some(callback) = self.breakpoints.get(&VirtAddr(reentry as usize)) {
+                        // This callback can potentially stop execution here.
+                        callback(mmu)?;
+                    }
+                    // If all is well jump back into the JIT code, but force a new entry point so
+                    // we don't end up in an endless loop of breakpoints and despair.
+                    overwrite_jit_address = Some(arg1 as usize);
+                }
+                x => unimplemented!("JIT Exit code not handled: {}.", x),
+            }
+        }
+       // Err(VmExit::Exit(-1))
+    }
+
+
 }
 

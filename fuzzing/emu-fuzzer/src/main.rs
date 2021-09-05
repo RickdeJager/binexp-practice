@@ -12,7 +12,7 @@ mod jitcache;
 
 use std::fs;
 use mmu::{Mmu, VirtAddr};
-use emu::{Emulator, Archs, FaultType, VirtAddrType};
+use emu::{Emulator, Archs, FaultType, VirtAddrType, VmExit};
 use util::load_elf;
 use jitcache::JitCache;
 
@@ -22,6 +22,8 @@ use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 
 pub const ALLOW_GUEST_PRINT: bool = false;
 pub const ONE_SHOT: bool = false;
+pub const END_EARLY: bool = true;
+pub const FORCE_INTERPRETER: bool = false;
 
 // I/O settings
 pub const CRASHES_DIR: &str = "./crashes";
@@ -29,11 +31,11 @@ pub const CORPUS_DIR : &str = "./corpus";
 pub const TEST_FILE : &str = "testfile";
 
 // Statistics
-const BATCH_SIZE: usize = 50;
+const BATCH_SIZE: usize = 100;
 const NUM_THREADS: usize = 8;
 
 // Fuzzy tweakables
-const CORRUPTION_AMOUNT: usize = 60;
+const CORRUPTION_AMOUNT: usize = 32;
 
 pub struct Rng(u64);
 
@@ -142,16 +144,21 @@ fn main() {
     println!(">>> Entry {:x}", entryp);
     println!(">>> Stack {:x} - {:x}", stack.0-stack_size, stack.0);
 
+    // Pre-run the template emulator until the first `open` call
+    // TODO; * manually obj-dumped for now
+    let start_point = VirtAddr(0x9b19cusize);
+    let end_point = VirtAddr(0x185a4usize);
+    golden_emu.step_until(start_point).expect("Failed to pre-run the golden-emu.");
+
+    if END_EARLY {
+        golden_emu.set_end_of_fuzz_case(end_point);
+    }
     
     if ONE_SHOT {
         println!(">>> run: {:x?}", golden_emu.run());
         println!(">>> PC : {:x?}", golden_emu.arch.get_program_counter());
         return;
     }
-
-    // Pre-run the template emulator until the first `open` call
-    // TODO; * manually obj-dumped for now
-    golden_emu.run_until(0x9b19c).expect("Failed to pre-run the golden-emu.");
 
     // Keep track of all threads
     let mut threads = Vec::new();
@@ -212,18 +219,22 @@ fn worker(golden_emu: Arc<Emulator>, thread_id: usize, stats: Arc<Stats>) {
             mut_cycles += util::rdtsc() - it;
             
             let it = util::rdtsc();
-            //let ret = emu.run_until(0x185a4).unwrap();
-            let ret = emu.run();
-            //let ret = emu.run_emu();
+            
+            let ret: (usize, VmExit);
+            if FORCE_INTERPRETER {
+                ret = emu.run_emu();
+            } else {
+                ret = emu.run();
+            }
             vm_cycles += util::rdtsc() - it;
 
+            let it = util::rdtsc();
             instructions += ret.0;
             // TODO; Check for syscall not implemented
             if let Some(reason) = ret.1.is_crash() {
                 crashes += crash_handler(&mut emu, &reason);
             }
 
-            let it = util::rdtsc();
             emu.reset(&golden_emu);
             reset_cycles += util::rdtsc() - it;
         }

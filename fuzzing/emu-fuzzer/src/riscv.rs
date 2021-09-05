@@ -1,15 +1,12 @@
-use crate::emu::{Arch, PreArch, VmExit};
+use crate::emu::{Arch, PreArch, VmExit, BreakpointMap};
 use crate::mmu::{Mmu, Perm, VirtAddr};
 use crate::mmu::{PERM_READ, PERM_EXEC, DIRTY_BLOCK_SIZE};
 
 use crate::syscall;
 use crate::files::FilePool;
 use crate::util;
-use crate::jitcache::JitCache;
 
-use std::process::Command;
 use std::convert::TryFrom;
-use std::sync::Arc;
 
 /// 64 bit RISC-V registers
 const NUM_REGISTERS: usize = 33;
@@ -124,6 +121,507 @@ impl RiscV {
         0
     }
 
+}
+
+impl Arch for RiscV {
+
+    fn get_register_raw(&self, reg: usize) -> Option<u64> {
+        if reg >= NUM_REGISTERS {
+            return None;
+        }
+        Some(self.registers[reg])
+    }
+
+    #[inline]
+    fn set_stackp(&mut self, value: u64) {
+        self.registers[Register::Sp as usize] = value;
+    }
+
+    fn set_register_raw(&mut self, reg: usize, value: u64) -> Option<()> {
+        if reg >= NUM_REGISTERS {
+            return None;
+        }
+
+        self.registers[reg] = value;
+        Some(())
+    }
+
+    #[inline]
+    fn get_register_state(&self) -> &[u64] {
+        &(self.registers)
+    }
+
+    #[inline]
+    fn get_register_pointer(&self) -> usize {
+        self.registers.as_ptr() as usize
+    }
+
+    #[inline]
+    fn get_program_counter(&self) -> u64 {
+        self.get_register(Register::Pc)
+    }
+
+    #[inline]
+    fn set_program_counter(&mut self, value: u64) {
+        self.registers[Register::Pc as usize] = value;
+    }
+
+    fn set_register_state(&mut self, new_regs: &[u64]) -> Option<()> {
+        self.registers = <[u64; NUM_REGISTERS]>::try_from(new_regs.clone()).ok()?;
+        Some(())
+    }
+
+    fn fork(&self) -> Box<dyn Arch + Send + Sync> {
+        Box::new(RiscV {
+            registers: <[u64; NUM_REGISTERS]>::try_from(
+                           self.get_register_state().clone()).unwrap(),
+        })
+    }
+
+    fn tick(&mut self, mmu: &mut Mmu, file_pool: &mut FilePool, break_map: &BreakpointMap) 
+            -> Result<(), VmExit> {
+
+        // Fetch the current PC.
+        let pc = self.get_register(Register::Pc);
+        // Fetch the current instruction
+        let addr = VirtAddr(pc as usize);
+
+        // First resolve any callbacks
+        if let Some(callback) = break_map.get(&addr) {
+            callback(mmu)?
+        }
+
+        let inst = mmu_read_perms!(mmu, addr, Perm(PERM_EXEC), u32)?;
+        let opcode = inst & 0b1111111;
+        //DEBUG
+        //print!("Opcode: {:07b} PC: {:x?}\n", opcode, pc);
+
+        match opcode {
+            0b0110111 => {
+                // LUI: Load Upper Immediate
+                let inst = Utype::from(inst);
+                self.set_register(inst.rd, inst.imm as i64 as u64);
+            },
+
+            0b0010111 => {
+                // AUIPC: Add upper immediate to PC, store result in reg
+                let inst = Utype::from(inst);
+                self.set_register(inst.rd, (inst.imm as i64 as u64).wrapping_add(pc));
+            },
+
+            0b1101111 => {
+                // JAL: Jump and store the link address in reg
+                let inst = Jtype::from(inst);
+                // Save the return address in reg
+                self.set_register(inst.rd, pc.wrapping_add(4));
+                // Jump by adding to the PC reg
+                self.set_register(Register::Pc, pc.wrapping_add(inst.imm as i64 as u64));
+                return Ok(());
+            },
+
+            0b1100111 => {
+                // JALR: Jump and link register
+                let inst = Itype::from(inst);
+                match inst.funct3 {
+                    0b000 => {
+                        let target = self.get_register(inst.rs1)
+                            .wrapping_add(inst.imm as i64 as u64);
+                        // Save the return addr
+                        self.set_register(inst.rd, pc.wrapping_add(4));
+                        // Jump to target
+                        self.set_register(Register::Pc, target);
+                        return Ok(());
+                    },
+                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n",
+                                 inst.funct3, opcode)},
+                }
+            },
+
+            0b1100011 => {
+                // BXX: Branch instructions
+                let inst = Btype::from(inst);
+
+                let rs1 = self.get_register(inst.rs1);
+                let rs2 = self.get_register(inst.rs2);
+
+                match inst.funct3 {
+                    0b000 => {
+                        // BEQ: Branch if EQual
+                        if rs1 == rs2 {
+                            self.set_register(Register::Pc,
+                                              pc.wrapping_add(inst.imm as i64 as u64));
+                            return Ok(());
+                        }
+                    },
+                    0b001 => {
+                        // BNQ: Branch if Not eQual
+                        if rs1 != rs2 {
+                            self.set_register(Register::Pc,
+                                              pc.wrapping_add(inst.imm as i64 as u64));
+                            return Ok(());
+                        }
+                    },
+                    0b100 => {
+                        // BLT: Branch if less than
+                        if (rs1 as i64) < (rs2 as i64) {
+                            self.set_register(Register::Pc,
+                                              pc.wrapping_add(inst.imm as i64 as u64));
+                            return Ok(());
+                        }
+                    },
+                    0b101 => {
+                        // BGE: Branch if greater of equal
+                        if rs1 as i64 >= rs2 as i64 {
+                            self.set_register(Register::Pc,
+                                              pc.wrapping_add(inst.imm as i64 as u64));
+                            return Ok(());
+                        }
+                    },
+                    0b110 => {
+                        // BLTU: Branch if less than (unsigned version)
+                        if (rs1 as u64) < (rs2 as u64) {
+                            self.set_register(Register::Pc,
+                                              pc.wrapping_add(inst.imm as i64 as u64));
+                            return Ok(());
+                        }
+                    },
+                    0b111 => {
+                        // BGEU: Branch if greater than or equal (unsigned version)
+                        if (rs1 as u64) >= (rs2 as u64) {
+                            self.set_register(Register::Pc,
+                                              pc.wrapping_add(inst.imm as i64 as u64));
+                            return Ok(());
+                        }
+                    },
+                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
+                                 inst.funct3, opcode)},
+                }
+            },
+
+            0b0000011 => {
+                // LX: Load instructions
+                let inst = Itype::from(inst);
+
+                // Compute the address
+                let addr = VirtAddr(self.get_register(inst.rs1)
+                                    .wrapping_add(inst.imm as i64 as u64) as usize);
+
+                match inst.funct3 {
+                    0b000 => {
+                        // LB: Load byte
+                        let val = mmu_read!(mmu, addr, i8)?;
+                        self.set_register(inst.rd, val as i64 as u64);
+                    },
+                    0b001 => {
+                        // LH: Load half word
+                        let val = mmu_read!(mmu, addr, i16)?;
+                        self.set_register(inst.rd, val as i64 as u64);
+                    },
+                    0b010 => {
+                        // LW: Load word
+                        let val = mmu_read!(mmu, addr, i32)?;
+                        self.set_register(inst.rd, val as i64 as u64);
+                    },
+                    0b100 => {
+                        // LBU: Load byte unsigned.
+                        let val = mmu_read!(mmu, addr, u8)?;
+                        self.set_register(inst.rd, val as u64);
+                    },
+                    0b101 => {
+                        // LHU: Load half word unsigned
+                        let val = mmu_read!(mmu, addr, u16)?;
+                        self.set_register(inst.rd, val as u64);
+                    },
+                    0b110 => {
+                        // LWU: Load word unsigned
+                        let val = mmu_read!(mmu, addr, u32)?;
+                        self.set_register(inst.rd, val as u64);
+                    },
+                    0b011 => {
+                        // LD: Load double word
+                        let val = mmu_read!(mmu, addr, i64)?;
+                        self.set_register(inst.rd, val as u64);
+                    },
+                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n",
+                                 inst.funct3, opcode)},
+                }
+            },
+            0b0100011 => {
+                // SX: Store instructions
+                let inst = Stype::from(inst);
+
+                // Compute the address
+                let addr = VirtAddr(self.get_register(inst.rs1)
+                                    .wrapping_add(inst.imm as i64 as u64) as usize);
+                match inst.funct3 {
+                    0b000 => {
+                        // SB: Store byte
+                        let val = self.get_register(inst.rs2) as u8;
+                        mmu_write!(mmu, addr, val)?;
+                    },
+                    0b001 => {
+                        // SH: Store half word
+                        let val = self.get_register(inst.rs2) as u16;
+                        mmu_write!(mmu, addr, val)?;
+                    },
+                    0b010 => {
+                        // SW: Store word
+                        let val = self.get_register(inst.rs2) as u32;
+                        mmu_write!(mmu, addr, val)?;
+                    },
+                    0b011 => {
+                        // SD: Store double word
+                        let val = self.get_register(inst.rs2) as u64;
+                        mmu_write!(mmu, addr, val)?;
+                    },
+                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n",
+                                 inst.funct3, opcode)},
+                }
+            },
+
+            0b0010011 => {
+                // Register-Immediate operations
+                let inst = Itype::from(inst);
+                let rs1 = self.get_register(inst.rs1);
+                let imm = inst.imm as i64 as u64;
+
+                match inst.funct3 {
+                    0b000 => {
+                        // ADDI: Add immediate to register
+                        self.set_register(inst.rd, rs1.wrapping_add(imm));
+                    },
+                    0b010 => {
+                        // SLTI: Set to one if less than imm
+                        if (rs1 as i64) < (imm as i64) {
+                            self.set_register(inst.rd, 1);
+                        } else {
+                            self.set_register(inst.rd, 0);
+                        }
+                    },
+                    0b011 => {
+                        // SLTIU: Set to one if less than imm (unsigned)
+                        if (rs1 as u64) < (imm as u64) {
+                            self.set_register(inst.rd, 1);
+                        } else {
+                            self.set_register(inst.rd, 0);
+                        }
+                    },
+                    0b100 => {
+                        // XORI: Xor RS1 with the immediate
+                        self.set_register(inst.rd, rs1 ^ imm);
+                    },
+                    0b110 => {
+                        // ORI: Or RS1 with the immediate
+                        self.set_register(inst.rd, rs1 | imm);
+                    },
+                    0b111 => {
+                        // ANDI: AND RS1 with the immediate
+                        self.set_register(inst.rd, rs1 & imm);
+                    },
+                    0b001 => {
+                        let mode = (inst.imm >> 6) & 0b111111;
+                        match mode {
+                            0b000000 => {
+                                // SLLI: Shift-left logical immediate
+                                let shamt = inst.imm & 0b111111;
+                                self.set_register(inst.rd, rs1 << shamt);
+                            },
+                            _ => panic!("Unknown shift mode in opcode {:#09b}\n", opcode),
+                        }
+                    },
+                    0b101 => {
+                        let mode = (inst.imm >> 6) & 0b111111;
+                        let shamt = inst.imm & 0b111111;
+                        match mode {
+                            0b000000 => {
+                                // SRLI: Shift-right logical immediate
+                                self.set_register(inst.rd, rs1 >> shamt);
+                            },
+                            0b010000 => {
+                                // SRAI: Shift-right arith immediate
+                                self.set_register(inst.rd, ((rs1 as i64) >> shamt) as u64);
+                            },
+                            _ => panic!("Unknown shift mode in opcode {:#09b}\n", opcode),
+
+                        }
+                    },
+                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n",
+                                 inst.funct3, opcode)},
+                }
+            },
+
+            0b0110011 => {
+                // Register-Register operations
+                let inst = Rtype::from(inst);
+
+                let rs1 = self.get_register(inst.rs1);
+                let rs2 = self.get_register(inst.rs2);
+
+                match (inst.funct7, inst.funct3) {
+                    (0b0000000, 0b000) => {
+                        // ADD: Adds two registers, stores result in rd
+                        self.set_register(inst.rd, rs1.wrapping_add(rs2));
+                    },
+                    (0b0100000, 0b000) => {
+                        // SUB: Subtracts two registers, stores result in rd
+                        self.set_register(inst.rd, rs1.wrapping_sub(rs2));
+                    },
+                    (0b0000000, 0b001) => {
+                        // SLL: Shift-left logical
+                        let shamt = rs2 & 0b11111;
+                        self.set_register(inst.rd, rs1 << shamt);
+                    },
+                    (0b0000000, 0b010) => {
+                        // SLT: Set less than
+                        if (rs1 as i64) < (rs2 as i64) {
+                            self.set_register(inst.rd, 1);
+                        } else {
+                            self.set_register(inst.rd, 0);
+                        }
+                    },
+                    (0b0000000, 0b011) => {
+                        // SLT: Set less than (unsigned)
+                        if (rs1 as u64) < (rs2 as u64) {
+                            self.set_register(inst.rd, 1);
+                        } else {
+                            self.set_register(inst.rd, 0);
+                        }
+                    },
+                    (0b0000000, 0b100) => {
+                        // XOR: Xor two registers
+                        self.set_register(inst.rd, rs1 ^ rs2);
+                    },
+                    (0b0000000, 0b101) => {
+                        // SRL: Shift-right locical
+                        let shamt = rs2 & 0b11111;
+                        self.set_register(inst.rd, rs1 >> shamt);
+                    },
+                    (0b0100000, 0b101) => {
+                        // SRA: Shift-right arith.
+                        let shamt = rs2 & 0b11111;
+                        self.set_register(inst.rd, ((rs1 as i64) >> shamt) as u64);
+                    },
+                    (0b0000000, 0b110) => {
+                        // OR: Or two registers
+                        self.set_register(inst.rd, rs1 | rs2);
+                    },
+                    (0b0000000, 0b111) => {
+                        // AND: AND two registers
+                        self.set_register(inst.rd, rs1 & rs2);
+                    },
+                    _ => {panic!(
+                            "Unknown (funct7, funct3): ({:#07b}, {:#03b}) in opcode: {:#09b}\n",
+                            inst.funct7, inst.funct3, opcode)},
+                }
+            },
+            0b0011011 => {
+                // 64 bit register-immediate.
+                let inst = Itype::from(inst);
+                let rs1 = self.get_register(inst.rs1) as i32;
+                let imm = inst.imm;
+
+                match inst.funct3 {
+                    0b000 => {
+                        // ADDIW: Add immediate to register
+                        self.set_register(inst.rd, rs1.wrapping_add(imm) as i32 as i64 as u64);
+                    },
+                    0b001 => {
+                        let mode = (inst.imm >> 5) & 0b1111111;
+                        match mode {
+                            0b0000000 => {
+                                // SLLI: Shift-left logical immediate
+                                let shamt = inst.imm & 0b11111;
+                                self.set_register(inst.rd, (rs1 << shamt) as i32 as i64 as u64);
+                            },
+                            _ => panic!("Unknown shift mode in opcode {:#09b}\n", opcode),
+                        }
+                    },
+                    0b101 => {
+                        let mode = (inst.imm >> 5) & 0b1111111;
+                        let shamt = inst.imm & 0b11111;
+                        match mode {
+                            0b0000000 => {
+                                // SRLIW: Shift-right logical immediate
+                                self.set_register(inst.rd, (rs1 >> shamt) as i32 as i64 as u64);
+                            },
+                            0b0100000 => {
+                                // SRAIW: Shift-right arith immediate
+                                self.set_register(inst.rd, ((rs1 as i32) >> shamt) as i64 as u64);
+                            },
+                            _ => panic!("Unknown shift mode in opcode {:#09b}\n", opcode),
+                        };
+                    },
+                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n",
+                                 inst.funct3, opcode)},
+                }
+            },
+
+            0b0111011 => {
+                // Register-Register operations (64 bit)
+                let inst = Rtype::from(inst);
+
+                let rs1 = self.get_register(inst.rs1) as u32;
+                let rs2 = self.get_register(inst.rs2) as u32;
+
+                match (inst.funct7, inst.funct3) {
+                    (0b0000000, 0b000) => {
+                        // ADDW: Adds two registers, stores result in rd
+                        self.set_register(inst.rd, rs1.wrapping_add(rs2) as i32 as i64 as u64);
+                    },
+                    (0b0100000, 0b000) => {
+                        // SUBW: Subtracts two registers, stores result in rd
+                        self.set_register(inst.rd, rs1.wrapping_sub(rs2) as i32 as i64 as u64);
+                    },
+                    (0b0000000, 0b001) => {
+                        // SLLW: Shift-left logical
+                        let shamt = rs2 & 0b11111;
+                        self.set_register(inst.rd, (rs1 << shamt) as i32 as i64 as u64);
+                    },
+                    (0b0000000, 0b101) => {
+                        // SRLW: Shift-right locical
+                        let shamt = rs2 & 0b11111;
+                        self.set_register(inst.rd, (rs1 >> shamt) as i32 as i64 as u64);
+                    },
+                    (0b0100000, 0b101) => {
+                        // SRAW: Shift-right arith.
+                        let shamt = rs2 & 0b11111;
+                        self.set_register(inst.rd, ((rs1 as i32) >> shamt) as i64 as u64);
+                    }
+                    _ => {panic!(
+                            "Unknown (funct7, funct3): ({:#07b}, {:#03b}) in opcode: {:#09b}\n",
+                            inst.funct7, inst.funct3, opcode)},
+                }
+            },
+
+            0b0001111 => {
+                let inst = Itype::from(inst);
+                match inst.funct3 {
+                    0b000 => {
+                        //FENCE
+                    }
+                    _ => unreachable!(),
+                }
+            },
+            0b1110011 => {
+                if        inst == 0b00000000000000000000000001110011 {
+                    // ECALL
+                    self.handle_syscall(mmu, file_pool)?;
+                } else if inst == 0b00000000000100000000000001110011 {
+                    // EBREAK
+                } else {
+                    unreachable!();
+                }
+            },
+
+            _ => {panic!("Unknown opcode: {:#09b}\n", opcode)},
+        }
+
+        // Update the program counter to the next instruction
+        self.set_register(Register::Pc, pc.wrapping_add(4));
+        Ok(())
+    }
+
+
     /// Translate RiscV syscall numbers into the proper syscall handler,
     /// and arguments / return values.
     fn handle_syscall(&mut self, mmu: &mut Mmu, file_pool: &mut FilePool) -> Result<(), VmExit> {
@@ -192,8 +690,12 @@ impl RiscV {
         }
     }
 
-    fn generate_jit(&mut self, pc: VirtAddr, num_blocks: usize, mmu: &mut Mmu)
-        -> Result<String, VmExit> {
+    /// Go through and generate the required assembly for a given PC.
+    /// This function will return a big x86 assembly string that can be assembled with nasm.
+    ///
+    /// In case a fault is encountered while emitting assembly, a Err(VmExit) will be returned.
+    fn generate_jit(&mut self, pc: VirtAddr, num_blocks: usize, mmu: &mut Mmu,
+                    break_map: &BreakpointMap) -> Result<String, VmExit> {
         let mut asm = "[bits 64]\n".to_string();
         let mut pc = pc.0 as u64;
 
@@ -209,6 +711,18 @@ impl RiscV {
             //DEBUG
             //print!("Opcode: {:07b} PC: {:x?}\n", opcode, pc);
 
+            // First insert breakpoints
+            if break_map.contains_key(&addr) {
+                asm += &format!(r#"
+                    mov eax, 6
+                    mov rdx, {pc}
+                    ; Save a relative address here, so we can return to JIT execution, while
+                    ; skipping the previous 2 instructions.
+                    mov rcx, [rel .continue]
+                    ret
+                    .continue:
+                "#, pc = pc);
+            }
 
             // Load VM register into a "real" x86 register
             macro_rules! load_reg  {
@@ -440,12 +954,13 @@ impl RiscV {
                                      inst.funct3, opcode)},
                     };
 
-                    // DIRTY_BLOCK_SIZE is required to be a power of 2, wich means we can just
+                    // DIRTY_BLOCK_SIZE is required to be a power of 2, which means we can just
                     // shift an address down by `shamt` to get the block idx.
                     let dirty_block_shamt = DIRTY_BLOCK_SIZE.trailing_zeros();
 
                     asm += &format!(r#"
                         {load_rax_from_rs1}
+                        add rax, {imm}
                         {load_rdx_from_rs2}
 
                         ; Bounds check first
@@ -466,14 +981,26 @@ impl RiscV {
                         mov rcx, rax
                         shr rcx, {dirty_block_shamt}
                         bts qword [r11], rcx
-                        jc .do_store
+                        jc .dirty2
 
                         ; The block wasn't marked dirty yet, add its index to the dirty list.
                         mov qword[r10 + r12*8], rcx
                         inc r12
+
+                        ; Repeat the process to catch the edge case where a single write straddles
+                        ; the edge of a block border. (For example, an unaligned qword write)
+                        .dirty2:
+                        mov rcx, rax
+                        add rcx, {size}
+                        shr rcx, {dirty_block_shamt}
+                        bts qword [r11], rcx
+                        jc .do_store
+
+                        mov qword[r10 + r12*8], rcx
+                        inc r12
                         
                         .do_store:
-                        {store_type} {store_size} [r8 + rax + {imm}], {reg}
+                        {store_type} {store_size} [r8 + rax] , {reg}
                     "#, imm = inst.imm,
                         dirty_block_shamt = dirty_block_shamt,
                         store_type = store_type, store_size = store_size, reg = reg,
@@ -911,602 +1438,10 @@ impl RiscV {
         // Return the assembly we generated.
         Ok(asm)
     }
-}
-
-impl Arch for RiscV {
-
-    fn get_register_raw(&self, reg: usize) -> Option<u64> {
-        if reg >= NUM_REGISTERS {
-            return None;
-        }
-        Some(self.registers[reg])
-    }
-
-    fn set_entry(&mut self, value: u64) {
-        self.registers[Register::Pc as usize] = value;
-    }
-
-    fn set_stackp(&mut self, value: u64) {
-        self.registers[Register::Sp as usize] = value;
-    }
-
-    fn set_register_raw(&mut self, reg: usize, value: u64) -> Option<()> {
-        if reg >= NUM_REGISTERS {
-            return None;
-        }
-
-        self.registers[reg] = value;
-        Some(())
-    }
-
-    fn get_register_state(&self) -> &[u64] {
-        &(self.registers)
-    }
-
-    fn get_program_counter(&self) -> u64 {
-        self.get_register(Register::Pc)
-    }
-
-    fn set_register_state(&mut self, new_regs: &[u64]) -> Option<()> {
-        self.registers = <[u64; NUM_REGISTERS]>::try_from(new_regs.clone()).ok()?;
-        Some(())
-    }
-
-    fn fork(&self) -> Box<dyn Arch + Send + Sync> {
-        Box::new(RiscV {
-            registers: <[u64; NUM_REGISTERS]>::try_from(
-                           self.get_register_state().clone()).unwrap(),
-        })
-    }
-
-    fn tick(&mut self, mmu: &mut Mmu, file_pool: &mut FilePool) -> Result<(), VmExit> {
-        // Fetch the current PC.
-        let pc = self.get_register(Register::Pc);
-        // Fetch the current instruction
-        let addr = VirtAddr(pc as usize);
-        let inst = mmu_read_perms!(mmu, addr, Perm(PERM_EXEC), u32)?;
-
-        let opcode = inst & 0b1111111;
-        //DEBUG
-        //print!("Opcode: {:07b} PC: {:x?}\n", opcode, pc);
-
-        match opcode {
-            0b0110111 => {
-                // LUI: Load Upper Immediate
-                let inst = Utype::from(inst);
-                self.set_register(inst.rd, inst.imm as i64 as u64);
-            },
-
-            0b0010111 => {
-                // AUIPC: Add upper immediate to PC, store result in reg
-                let inst = Utype::from(inst);
-                self.set_register(inst.rd, (inst.imm as i64 as u64).wrapping_add(pc));
-            },
-
-            0b1101111 => {
-                // JAL: Jump and store the link address in reg
-                let inst = Jtype::from(inst);
-                // Save the return address in reg
-                self.set_register(inst.rd, pc.wrapping_add(4));
-                // Jump by adding to the PC reg
-                self.set_register(Register::Pc, pc.wrapping_add(inst.imm as i64 as u64));
-                return Ok(());
-            },
-
-            0b1100111 => {
-                // JALR: Jump and link register
-                let inst = Itype::from(inst);
-                match inst.funct3 {
-                    0b000 => {
-                        let target = self.get_register(inst.rs1)
-                            .wrapping_add(inst.imm as i64 as u64);
-                        // Save the return addr
-                        self.set_register(inst.rd, pc.wrapping_add(4));
-                        // Jump to target
-                        self.set_register(Register::Pc, target);
-                        return Ok(());
-                    },
-                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n",
-                                 inst.funct3, opcode)},
-                }
-            },
-
-            0b1100011 => {
-                // BXX: Branch instructions
-                let inst = Btype::from(inst);
-
-                let rs1 = self.get_register(inst.rs1);
-                let rs2 = self.get_register(inst.rs2);
-
-                match inst.funct3 {
-                    0b000 => {
-                        // BEQ: Branch if EQual
-                        if rs1 == rs2 {
-                            self.set_register(Register::Pc,
-                                              pc.wrapping_add(inst.imm as i64 as u64));
-                            return Ok(());
-                        }
-                    },
-                    0b001 => {
-                        // BNQ: Branch if Not eQual
-                        if rs1 != rs2 {
-                            self.set_register(Register::Pc,
-                                              pc.wrapping_add(inst.imm as i64 as u64));
-                            return Ok(());
-                        }
-                    },
-                    0b100 => {
-                        // BLT: Branch if less than
-                        if (rs1 as i64) < (rs2 as i64) {
-                            self.set_register(Register::Pc,
-                                              pc.wrapping_add(inst.imm as i64 as u64));
-                            return Ok(());
-                        }
-                    },
-                    0b101 => {
-                        // BGE: Branch if greater of equal
-                        if rs1 as i64 >= rs2 as i64 {
-                            self.set_register(Register::Pc,
-                                              pc.wrapping_add(inst.imm as i64 as u64));
-                            return Ok(());
-                        }
-                    },
-                    0b110 => {
-                        // BLTU: Branch if less than (unsigned version)
-                        if (rs1 as u64) < (rs2 as u64) {
-                            self.set_register(Register::Pc,
-                                              pc.wrapping_add(inst.imm as i64 as u64));
-                            return Ok(());
-                        }
-                    },
-                    0b111 => {
-                        // BGEU: Branch if greater than or equal (unsigned version)
-                        if (rs1 as u64) >= (rs2 as u64) {
-                            self.set_register(Register::Pc,
-                                              pc.wrapping_add(inst.imm as i64 as u64));
-                            return Ok(());
-                        }
-                    },
-                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
-                                 inst.funct3, opcode)},
-                }
-            },
-
-            0b0000011 => {
-                // LX: Load instructions
-                let inst = Itype::from(inst);
-
-                // Compute the address
-                let addr = VirtAddr(self.get_register(inst.rs1)
-                                    .wrapping_add(inst.imm as i64 as u64) as usize);
-
-                match inst.funct3 {
-                    0b000 => {
-                        // LB: Load byte
-                        let val = mmu_read!(mmu, addr, i8)?;
-                        self.set_register(inst.rd, val as i64 as u64);
-                    },
-                    0b001 => {
-                        // LH: Load half word
-                        let val = mmu_read!(mmu, addr, i16)?;
-                        self.set_register(inst.rd, val as i64 as u64);
-                    },
-                    0b010 => {
-                        // LW: Load word
-                        let val = mmu_read!(mmu, addr, i32)?;
-                        self.set_register(inst.rd, val as i64 as u64);
-                    },
-                    0b100 => {
-                        // LBU: Load byte unsigned.
-                        let val = mmu_read!(mmu, addr, u8)?;
-                        self.set_register(inst.rd, val as u64);
-                    },
-                    0b101 => {
-                        // LHU: Load half word unsigned
-                        let val = mmu_read!(mmu, addr, u16)?;
-                        self.set_register(inst.rd, val as u64);
-                    },
-                    0b110 => {
-                        // LWU: Load word unsigned
-                        let val = mmu_read!(mmu, addr, u32)?;
-                        self.set_register(inst.rd, val as u64);
-                    },
-                    0b011 => {
-                        // LD: Load double word
-                        let val = mmu_read!(mmu, addr, i64)?;
-                        self.set_register(inst.rd, val as u64);
-                    },
-                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n",
-                                 inst.funct3, opcode)},
-                }
-            },
-            0b0100011 => {
-                // SX: Store instructions
-                let inst = Stype::from(inst);
-
-                // Compute the address
-                let addr = VirtAddr(self.get_register(inst.rs1)
-                                    .wrapping_add(inst.imm as i64 as u64) as usize);
-                match inst.funct3 {
-                    0b000 => {
-                        // SB: Store byte
-                        let val = self.get_register(inst.rs2) as u8;
-                        mmu_write!(mmu, addr, val)?;
-                    },
-                    0b001 => {
-                        // SH: Store half word
-                        let val = self.get_register(inst.rs2) as u16;
-                        mmu_write!(mmu, addr, val)?;
-                    },
-                    0b010 => {
-                        // SW: Store word
-                        let val = self.get_register(inst.rs2) as u32;
-                        mmu_write!(mmu, addr, val)?;
-                    },
-                    0b011 => {
-                        // SD: Store double word
-                        let val = self.get_register(inst.rs2) as u64;
-                        mmu_write!(mmu, addr, val)?;
-                    },
-                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n",
-                                 inst.funct3, opcode)},
-                }
-            },
-
-            0b0010011 => {
-                // Register-Immediate operations
-                let inst = Itype::from(inst);
-                let rs1 = self.get_register(inst.rs1);
-                let imm = inst.imm as i64 as u64;
-
-                match inst.funct3 {
-                    0b000 => {
-                        // ADDI: Add immediate to register
-                        self.set_register(inst.rd, rs1.wrapping_add(imm));
-                    },
-                    0b010 => {
-                        // SLTI: Set to one if less than imm
-                        if (rs1 as i64) < (imm as i64) {
-                            self.set_register(inst.rd, 1);
-                        } else {
-                            self.set_register(inst.rd, 0);
-                        }
-                    },
-                    0b011 => {
-                        // SLTIU: Set to one if less than imm (unsigned)
-                        if (rs1 as u64) < (imm as u64) {
-                            self.set_register(inst.rd, 1);
-                        } else {
-                            self.set_register(inst.rd, 0);
-                        }
-                    },
-                    0b100 => {
-                        // XORI: Xor RS1 with the immediate
-                        self.set_register(inst.rd, rs1 ^ imm);
-                    },
-                    0b110 => {
-                        // ORI: Or RS1 with the immediate
-                        self.set_register(inst.rd, rs1 | imm);
-                    },
-                    0b111 => {
-                        // ANDI: AND RS1 with the immediate
-                        self.set_register(inst.rd, rs1 & imm);
-                    },
-                    0b001 => {
-                        let mode = (inst.imm >> 6) & 0b111111;
-                        match mode {
-                            0b000000 => {
-                                // SLLI: Shift-left logical immediate
-                                let shamt = inst.imm & 0b111111;
-                                self.set_register(inst.rd, rs1 << shamt);
-                            },
-                            _ => panic!("Unknown shift mode in opcode {:#09b}\n", opcode),
-                        }
-                    },
-                    0b101 => {
-                        let mode = (inst.imm >> 6) & 0b111111;
-                        let shamt = inst.imm & 0b111111;
-                        match mode {
-                            0b000000 => {
-                                // SRLI: Shift-right logical immediate
-                                self.set_register(inst.rd, rs1 >> shamt);
-                            },
-                            0b010000 => {
-                                // SRAI: Shift-right arith immediate
-                                self.set_register(inst.rd, ((rs1 as i64) >> shamt) as u64);
-                            },
-                            _ => panic!("Unknown shift mode in opcode {:#09b}\n", opcode),
-
-                        }
-                    },
-                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n",
-                                 inst.funct3, opcode)},
-                }
-            },
-
-            0b0110011 => {
-                // Register-Register operations
-                let inst = Rtype::from(inst);
-
-                let rs1 = self.get_register(inst.rs1);
-                let rs2 = self.get_register(inst.rs2);
-
-                match (inst.funct7, inst.funct3) {
-                    (0b0000000, 0b000) => {
-                        // ADD: Adds two registers, stores result in rd
-                        self.set_register(inst.rd, rs1.wrapping_add(rs2));
-                    },
-                    (0b0100000, 0b000) => {
-                        // SUB: Subtracts two registers, stores result in rd
-                        self.set_register(inst.rd, rs1.wrapping_sub(rs2));
-                    },
-                    (0b0000000, 0b001) => {
-                        // SLL: Shift-left logical
-                        let shamt = rs2 & 0b11111;
-                        self.set_register(inst.rd, rs1 << shamt);
-                    },
-                    (0b0000000, 0b010) => {
-                        // SLT: Set less than
-                        if (rs1 as i64) < (rs2 as i64) {
-                            self.set_register(inst.rd, 1);
-                        } else {
-                            self.set_register(inst.rd, 0);
-                        }
-                    },
-                    (0b0000000, 0b011) => {
-                        // SLT: Set less than (unsigned)
-                        if (rs1 as u64) < (rs2 as u64) {
-                            self.set_register(inst.rd, 1);
-                        } else {
-                            self.set_register(inst.rd, 0);
-                        }
-                    },
-                    (0b0000000, 0b100) => {
-                        // XOR: Xor two registers
-                        self.set_register(inst.rd, rs1 ^ rs2);
-                    },
-                    (0b0000000, 0b101) => {
-                        // SRL: Shift-right locical
-                        let shamt = rs2 & 0b11111;
-                        self.set_register(inst.rd, rs1 >> shamt);
-                    },
-                    (0b0100000, 0b101) => {
-                        // SRA: Shift-right arith.
-                        let shamt = rs2 & 0b11111;
-                        self.set_register(inst.rd, ((rs1 as i64) >> shamt) as u64);
-                    },
-                    (0b0000000, 0b110) => {
-                        // OR: Or two registers
-                        self.set_register(inst.rd, rs1 | rs2);
-                    },
-                    (0b0000000, 0b111) => {
-                        // AND: AND two registers
-                        self.set_register(inst.rd, rs1 & rs2);
-                    },
-                    _ => {panic!(
-                            "Unknown (funct7, funct3): ({:#07b}, {:#03b}) in opcode: {:#09b}\n",
-                            inst.funct7, inst.funct3, opcode)},
-                }
-            },
-            0b0011011 => {
-                // 64 bit register-immediate.
-                let inst = Itype::from(inst);
-                let rs1 = self.get_register(inst.rs1) as i32;
-                let imm = inst.imm;
-
-                match inst.funct3 {
-                    0b000 => {
-                        // ADDIW: Add immediate to register
-                        self.set_register(inst.rd, rs1.wrapping_add(imm) as i32 as i64 as u64);
-                    },
-                    0b001 => {
-                        let mode = (inst.imm >> 5) & 0b1111111;
-                        match mode {
-                            0b0000000 => {
-                                // SLLI: Shift-left logical immediate
-                                let shamt = inst.imm & 0b11111;
-                                self.set_register(inst.rd, (rs1 << shamt) as i32 as i64 as u64);
-                            },
-                            _ => panic!("Unknown shift mode in opcode {:#09b}\n", opcode),
-                        }
-                    },
-                    0b101 => {
-                        let mode = (inst.imm >> 5) & 0b1111111;
-                        let shamt = inst.imm & 0b11111;
-                        match mode {
-                            0b0000000 => {
-                                // SRLIW: Shift-right logical immediate
-                                self.set_register(inst.rd, (rs1 >> shamt) as i32 as i64 as u64);
-                            },
-                            0b0100000 => {
-                                // SRAIW: Shift-right arith immediate
-                                self.set_register(inst.rd, ((rs1 as i32) >> shamt) as i64 as u64);
-                            },
-                            _ => panic!("Unknown shift mode in opcode {:#09b}\n", opcode),
-                        };
-                    },
-                    _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n",
-                                 inst.funct3, opcode)},
-                }
-            },
-
-            0b0111011 => {
-                // Register-Register operations (64 bit)
-                let inst = Rtype::from(inst);
-
-                let rs1 = self.get_register(inst.rs1) as u32;
-                let rs2 = self.get_register(inst.rs2) as u32;
-
-                match (inst.funct7, inst.funct3) {
-                    (0b0000000, 0b000) => {
-                        // ADDW: Adds two registers, stores result in rd
-                        self.set_register(inst.rd, rs1.wrapping_add(rs2) as i32 as i64 as u64);
-                    },
-                    (0b0100000, 0b000) => {
-                        // SUBW: Subtracts two registers, stores result in rd
-                        self.set_register(inst.rd, rs1.wrapping_sub(rs2) as i32 as i64 as u64);
-                    },
-                    (0b0000000, 0b001) => {
-                        // SLLW: Shift-left logical
-                        let shamt = rs2 & 0b11111;
-                        self.set_register(inst.rd, (rs1 << shamt) as i32 as i64 as u64);
-                    },
-                    (0b0000000, 0b101) => {
-                        // SRLW: Shift-right locical
-                        let shamt = rs2 & 0b11111;
-                        self.set_register(inst.rd, (rs1 >> shamt) as i32 as i64 as u64);
-                    },
-                    (0b0100000, 0b101) => {
-                        // SRAW: Shift-right arith.
-                        let shamt = rs2 & 0b11111;
-                        self.set_register(inst.rd, ((rs1 as i32) >> shamt) as i64 as u64);
-                    }
-                    _ => {panic!(
-                            "Unknown (funct7, funct3): ({:#07b}, {:#03b}) in opcode: {:#09b}\n",
-                            inst.funct7, inst.funct3, opcode)},
-                }
-            },
-
-            0b0001111 => {
-                let inst = Itype::from(inst);
-                match inst.funct3 {
-                    0b000 => {
-                        //FENCE
-                    }
-                    _ => unreachable!(),
-                }
-            },
-            0b1110011 => {
-                if        inst == 0b00000000000000000000000001110011 {
-                    // ECALL
-                    self.handle_syscall(mmu, file_pool)?;
-                } else if inst == 0b00000000000100000000000001110011 {
-                    // EBREAK
-                } else {
-                    unreachable!();
-                }
-            },
-
-            _ => {panic!("Unknown opcode: {:#09b}\n", opcode)},
-        }
-
-        // Update the program counter to the next instruction
-        self.set_register(Register::Pc, pc.wrapping_add(4));
-        Ok(())
-    }
 
 
-    // TODO; Non of this is particularly Arch-specific, so it can be moved to emu / jitcache
-    fn run_jit(&mut self, mmu: &mut Mmu, file_pool: &mut FilePool,
-               jit_cache: &Arc<JitCache>) -> Result<(), VmExit> {
 
-        // use a temp directory to assemble in.
-        let tmpdir = std::env::temp_dir().join("fuzzy");
-        std::fs::create_dir_all(&tmpdir).expect("Failed to create tmp dir for JIT cache");
-        let thread_id = std::thread::current().id().as_u64();
-
-        loop {
-            let pc       = self.get_register(Register::Pc);
-            let jit_addr = jit_cache.lookup(VirtAddr(pc as usize));
-
-            // Get the addresses we need to run the JIT:
-            let (mem, perms, dirty, dirty_bitmap) = mmu.jit_addresses();
-            let translation_table = jit_cache.translation_table();
-
-            let jit_addr = match jit_addr {
-                None => {
-                    // Go through each instruction in the block to emit some x86_64 assembly
-                    let asm = self.generate_jit(VirtAddr(pc as usize),
-                                                jit_cache.num_blocks(), mmu)?;
-
-                    let asmfn = tmpdir.join(&format!("tmp-{}.asm", thread_id));
-                    let binfn = tmpdir.join(&format!("tmp-{}.bin", thread_id));
-                    std::fs::write(&asmfn, &asm).expect("Failed to drop ASM to disk");
-                    let nasm_res = Command::new("nasm")
-                        .args(&["-f", "bin", "-o", binfn.to_str().unwrap(),
-                                asmfn.to_str().unwrap()])
-                        .status()
-                        .expect("Failed to run `nasm`, is it in your PATH?");
-
-                    // Read the binary that nasm just generated for us.
-                    let tmp = std::fs::read(binfn).expect("Failed to read NASM output.");
-
-                    // Add the fresh JIT code to the mapping.
-                    jit_cache.add_mapping(VirtAddr(pc as usize), &tmp)
-                },
-                Some(jit_addr) => jit_addr,
-            };
-
-            let mut num_dirty_inuse = mmu.dirty_len();
-            let exit_code    : u64;
-            let reentry      : u64;
-            let guest_address: u64;
-
-            unsafe {
-
-                // Hop into the JIT
-                asm!(r#"
-                   call {entry}
-                "#,
-                entry = in(reg) jit_addr,
-                in("r8")  mem,
-                in("r9")  perms,
-                in("r10") dirty,
-                in("r11") dirty_bitmap,
-                inout("r12") num_dirty_inuse,
-                in("r13") self.registers.as_ptr(),
-                in("r14") translation_table,
-                // Let rust known what we potentially clobbered.
-                out("rax") exit_code,
-                out("rdx") reentry,
-                out("rcx") guest_address, // Contains the offending address for read/write faults
-                );
-
-                // Update the length of the dirty list, since we potentially added some items
-                // to its backing store.
-                mmu.set_dirty_len(num_dirty_inuse);
-            }
-
-            // DEBUG
-            //println!("JIT exited with {:#x}, reentry: {:#x}", exit_code, reentry);
-            match exit_code {
-                1 => {
-                    // Branch decode request, update PC and re-JIT
-                    self.set_register(Register::Pc, reentry)
-                },
-                2 => {
-                    // JIT encountered a syscall. Handle it and reenter.
-                    // (We need to set PC first, so a syscall can potentially set PC as well,
-                    //  like `sigreturn` for example.)
-                    self.set_register(Register::Pc, reentry);
-                    self.handle_syscall(mmu, file_pool)?;
-                },
-                4 => {
-                    // JIT encountered a read fault, let the fuzzer known we crashed.
-                   // TODO; 
-                   // - We don't currently pass the read size. Assuming 1 for now
-                   // - The crash_handler will request pc to dedupe crashes, which will be
-                   //   slightly off, due to lazy updating.
-                   //   Setting it here is a bit hacky
-                   self.set_register(Register::Pc, reentry);
-                   return Err(VmExit::ReadFault(VirtAddr(guest_address as usize), 1))
-                },
-                5 => {
-                    // JIT encountered a write fault, let the fuzzer known we crashed.
-                   // TODO; 
-                   // - We don't currently pass the read size. Assuming 1 for now
-                   // - The crash_handler will request pc to dedupe crashes, which will be
-                   //   slightly off, due to lazy updating.
-                   //   Setting it here is a bit hacky
-                   self.set_register(Register::Pc, reentry);
-                   return Err(VmExit::ReadFault(VirtAddr(guest_address as usize), 1))
-                },
-                x => unimplemented!("JIT Exit code not handled: {}.", x),
-            }
-        }
-       // Err(VmExit::Exit(-1))
-    }
-}
+  }
 
 
 struct Utype {

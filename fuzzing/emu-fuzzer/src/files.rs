@@ -8,6 +8,7 @@ use meowhash::MeowHasher;
 
 use crate::Rng;
 use crate::emu::{FaultType, VirtAddrType};
+use crate::TEST_FILE;
 
 pub const SEEK_SET: i32 = 0;
 pub const SEEK_CUR: i32 = 1;
@@ -248,8 +249,10 @@ impl FilePool {
     /// expensive clone action.
     pub fn randomize(&mut self, rng: &mut Rng, max_tweaks: usize) {
 
-        // Every one in 20 cases we swap files.
-        if rng.rand() % 20  == 0 {
+        // Every one in 50 cases we swap files.
+        // This is kinda costly, as we're doing a full copy.
+        // TODO; Just cache the entire corpus in mem and never clone?
+        if rng.rand() % 50  == 0 {
             // Pick a new file and copy the contents.
             // TODO; Move to RWLock
             let corpus_inputs = (*self.corpus).inputs.lock().unwrap();
@@ -266,14 +269,13 @@ impl FilePool {
 
     /// Remove all open Fd's.
     pub fn reset(&mut self) {
-        //self.open_fds.clear();
         // Remove everything that isn't stdin/stderr/stdout
         self.open_fds.drain(3..);
     }
 
     /// Assign an Fd to a file in the file pool
     pub fn open(&mut self, filepath: &str) -> Option<usize> {
-        if filepath == "testfile" {
+        if filepath == TEST_FILE {
                 self.open_fds.push(Fd{
                     filename: filepath.to_string(),
                     offset: 0,
