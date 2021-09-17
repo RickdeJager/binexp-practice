@@ -249,10 +249,10 @@ impl FilePool {
     /// expensive clone action.
     pub fn randomize(&mut self, rng: &mut Rng, max_tweaks: usize) {
 
-        // Every one in 50 cases we swap files.
+        // Every one in 20 cases we swap files.
         // This is kinda costly, as we're doing a full copy.
         // TODO; Just cache the entire corpus in mem and never clone?
-        if rng.rand() % 50  == 0 {
+        if rng.rand() % 20  == 0 {
             // Pick a new file and copy the contents.
             // TODO; Move to RWLock
             let corpus_inputs = (*self.corpus).inputs.lock().unwrap();

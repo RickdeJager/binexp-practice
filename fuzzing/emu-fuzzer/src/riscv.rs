@@ -1,6 +1,6 @@
 use crate::emu::{Arch, PreArch, VmExit, BreakpointMap};
 use crate::mmu::{Mmu, Perm, VirtAddr};
-use crate::mmu::{PERM_READ, PERM_EXEC, DIRTY_BLOCK_SIZE};
+use crate::mmu::{PERM_READ, PERM_EXEC, PERM_WRITE, DIRTY_BLOCK_SIZE};
 
 use crate::syscall;
 use crate::files::FilePool;
@@ -105,7 +105,6 @@ impl PreArch for RiscV {
 }
 
 impl RiscV {
-
     /// Architecture specific set_register routine, that knows about the Register
     /// enum for this arch.
     fn set_register(&mut self, reg: Register, value: u64) {
@@ -121,6 +120,58 @@ impl RiscV {
         0
     }
 
+    /// Print the entire register state for debug purposes.
+    fn print_state(&self) {
+        println!("
+PC : {:#018X}  RA : {:#018X}  SP : {:#018X}  GP : {:#018X}  TP : {:#018X}
+T0 : {:#018X}  T1 : {:#018X}  T2 : {:#018X}  S0 : {:#018X}  S1 : {:#018X}
+A0 : {:#018X}  A1 : {:#018X}  A2 : {:#018X}  A3 : {:#018X}  A4 : {:#018X}
+A5 : {:#018X}  A6 : {:#018X}  A7 : {:#018X}  S2 : {:#018X}  S3 : {:#018X}
+S4 : {:#018X}  S5 : {:#018X}  S6 : {:#018X}  S7 : {:#018X}  S8 : {:#018X}
+S9 : {:#018X}  S10: {:#018X}  S11: {:#018X}  T3 : {:#018X}  T4 : {:#018X}
+T5 : {:#018X}  T6 : {:#018X}
+
+",
+        self.get_register(Register::Pc),
+        self.get_register(Register::Ra),
+        self.get_register(Register::Sp),
+        self.get_register(Register::Gp),
+        self.get_register(Register::Tp),
+
+        self.get_register(Register::T0),
+        self.get_register(Register::T1),
+        self.get_register(Register::T2),
+        self.get_register(Register::S0),
+        self.get_register(Register::S1),
+
+        self.get_register(Register::A0),
+        self.get_register(Register::A1),
+        self.get_register(Register::A2),
+        self.get_register(Register::A3),
+        self.get_register(Register::A4),
+
+        self.get_register(Register::A5),
+        self.get_register(Register::A6),
+        self.get_register(Register::A7),
+        self.get_register(Register::S2),
+        self.get_register(Register::S3),
+
+        self.get_register(Register::S4),
+        self.get_register(Register::S5),
+        self.get_register(Register::S6),
+        self.get_register(Register::S7),
+        self.get_register(Register::S8),
+
+        self.get_register(Register::S9),
+        self.get_register(Register::S10),
+        self.get_register(Register::S11),
+        self.get_register(Register::T3),
+        self.get_register(Register::T4),
+
+        self.get_register(Register::T5),
+        self.get_register(Register::T6),
+        );
+    }
 }
 
 impl Arch for RiscV {
@@ -194,7 +245,7 @@ impl Arch for RiscV {
         let inst = mmu_read_perms!(mmu, addr, Perm(PERM_EXEC), u32)?;
         let opcode = inst & 0b1111111;
         //DEBUG
-        //print!("Opcode: {:07b} PC: {:x?}\n", opcode, pc);
+        //self.print_state();
 
         match opcode {
             0b0110111 => {
@@ -271,7 +322,7 @@ impl Arch for RiscV {
                     },
                     0b101 => {
                         // BGE: Branch if greater of equal
-                        if rs1 as i64 >= rs2 as i64 {
+                        if (rs1 as i64) >= (rs2 as i64) {
                             self.set_register(Register::Pc,
                                               pc.wrapping_add(inst.imm as i64 as u64));
                             return Ok(());
@@ -468,7 +519,7 @@ impl Arch for RiscV {
                     },
                     (0b0000000, 0b001) => {
                         // SLL: Shift-left logical
-                        let shamt = rs2 & 0b11111;
+                        let shamt = rs2 & 0b111111;
                         self.set_register(inst.rd, rs1 << shamt);
                     },
                     (0b0000000, 0b010) => {
@@ -493,12 +544,12 @@ impl Arch for RiscV {
                     },
                     (0b0000000, 0b101) => {
                         // SRL: Shift-right locical
-                        let shamt = rs2 & 0b11111;
+                        let shamt = rs2 & 0b111111;
                         self.set_register(inst.rd, rs1 >> shamt);
                     },
                     (0b0100000, 0b101) => {
                         // SRA: Shift-right arith.
-                        let shamt = rs2 & 0b11111;
+                        let shamt = rs2 & 0b111111;
                         self.set_register(inst.rd, ((rs1 as i64) >> shamt) as u64);
                     },
                     (0b0000000, 0b110) => {
@@ -517,8 +568,8 @@ impl Arch for RiscV {
             0b0011011 => {
                 // 64 bit register-immediate.
                 let inst = Itype::from(inst);
-                let rs1 = self.get_register(inst.rs1) as i32;
-                let imm = inst.imm;
+                let rs1 = self.get_register(inst.rs1) as u32;
+                let imm = inst.imm as u32;
 
                 match inst.funct3 {
                     0b000 => {
@@ -529,7 +580,7 @@ impl Arch for RiscV {
                         let mode = (inst.imm >> 5) & 0b1111111;
                         match mode {
                             0b0000000 => {
-                                // SLLI: Shift-left logical immediate
+                                // SLLIW: Shift-left logical immediate
                                 let shamt = inst.imm & 0b11111;
                                 self.set_register(inst.rd, (rs1 << shamt) as i32 as i64 as u64);
                             },
@@ -608,6 +659,7 @@ impl Arch for RiscV {
                     self.handle_syscall(mmu, file_pool)?;
                 } else if inst == 0b00000000000100000000000001110011 {
                     // EBREAK
+                    assert!(false, "Not expecting a ebreak this early in radare");
                 } else {
                     unreachable!();
                 }
@@ -624,6 +676,7 @@ impl Arch for RiscV {
 
     /// Translate RiscV syscall numbers into the proper syscall handler,
     /// and arguments / return values.
+    /// https://github.com/westerndigitalcorporation/RISC-V-Linux/blob/master/riscv-pk/pk/syscall.h
     fn handle_syscall(&mut self, mmu: &mut Mmu, file_pool: &mut FilePool) -> Result<(), VmExit> {
         let nr_syscall = self.get_register(Register::A7);
 
@@ -635,6 +688,15 @@ impl Arch for RiscV {
         let a2 = self.get_register(Register::A2);
 
         return match nr_syscall {
+            // openat
+            56 => {
+                // Get the pathname as a c string.
+                let path = util::get_c_string(&mmu, VirtAddr(a1 as usize))?;
+                if a0 == 0 { println!("dirfd was non-zero ({}), but it was ignore in openat", a0)};
+                let ret = syscall::open(file_pool, &path, a2 as i64)?;
+                self.set_register(Register::A0, ret as u64);
+                Ok(())
+            }
             // close
             57 => {
                 let ret = syscall::close(a0 as i64)?;
@@ -671,6 +733,39 @@ impl Arch for RiscV {
             93  => {syscall::exit(a0 as i64)?; Ok(())},
             // exit_group
             94  => {syscall::exit(a0 as i64)?; Ok(())},
+            // set_tid_address
+            96 => {syscall::set_tid_address(mmu, VirtAddr(a0 as usize))?; Ok(())}
+            // set_robust_list
+            99 => {
+                let ret = syscall::set_robust_list(mmu, VirtAddr(a0 as usize), a1 as i32)?;
+                self.set_register(Register::A0, ret as u64);
+                Ok(())
+            }
+            // rt_sigaction / rt_sigprocmask
+            134 | 135 => {
+                // TODO; Stubbed out
+                let ret = -1;
+                self.set_register(Register::A0, ret as u64);
+                Ok(())
+            }
+            // uname
+            160 => {
+                let ret = syscall::uname(mmu, VirtAddr(a0 as usize))?;
+                self.set_register(Register::A0, ret as u64);
+                Ok(())
+            }
+            // getuid and geteuid respectively.
+            174 | 175 => {
+                let ret = syscall::getuid()?;
+                self.set_register(Register::A0, ret as u64);
+                Ok(())
+            }
+            // getgid and getegid respectively.
+            176 | 177 => {
+                let ret = syscall::getgid()?;
+                self.set_register(Register::A0, ret as u64);
+                Ok(())
+            }
             // brk
             214 => {
                 let size = self.get_register(Register::A0) as i64;
@@ -678,6 +773,13 @@ impl Arch for RiscV {
                 self.set_register(Register::A0, ret as u64);
                 Ok(())
             },
+            // prlimit64
+            261 => {
+                // TODO; Stubbed out
+                let ret = -1;
+                self.set_register(Register::A0, ret as u64);
+                Ok(())
+            }
             // open
             1024 => {
                 // Get the pathname as a c string.
@@ -698,6 +800,7 @@ impl Arch for RiscV {
                     break_map: &BreakpointMap) -> Result<String, VmExit> {
         let mut asm = "[bits 64]\n".to_string();
         let mut pc = pc.0 as u64;
+        let mut instructions_in_block = 0u64;
 
         'next_inst: loop {
             // Fetch the current instruction
@@ -714,7 +817,7 @@ impl Arch for RiscV {
             // First insert breakpoints
             if break_map.contains_key(&addr) {
                 asm += &format!(r#"
-                    mov eax, 6
+                    mov eax, 3
                     mov rdx, {pc}
                     ; Save a relative address here, so we can return to JIT execution, while
                     ; skipping the previous 2 instructions.
@@ -749,6 +852,9 @@ impl Arch for RiscV {
                 }
             }
 
+            // Keep track of the number of instructions in this JIT block.
+            instructions_in_block += 1;
+
             match opcode {
                 0b0110111 => {
                     // LUI: Load Upper Immediate
@@ -761,7 +867,7 @@ impl Arch for RiscV {
                     let inst = Utype::from(inst);
                     let val = (inst.imm as i64 as u64).wrapping_add(pc);
                     asm += &format!(r#"
-                        mov rax, {val:#x}
+                        mov rax, {val}
                         {store_rd_from_rax}
                     "#, val = val, store_rd_from_rax = store_reg!(inst.rd, "rax"));
                 },
@@ -779,6 +885,8 @@ impl Arch for RiscV {
 
                     // First do the link, then lookup the jump target from the JIT map.
                     asm += &format!(r#"
+                        ; We're jumping unconditionally, so update the instruction counter.
+                        add r15, {instructions_in_block}
                         mov rax, {ret}
                         {store_rd_from_rax}
 
@@ -794,6 +902,7 @@ impl Arch for RiscV {
                         ret
                         
                     "#, ret = ret,
+                        instructions_in_block = instructions_in_block,
                         target = (target / 4) * 8, target_pc = target,
                         store_rd_from_rax = store_reg!(inst.rd, "rax"));
                     break 'next_inst;
@@ -805,34 +914,49 @@ impl Arch for RiscV {
                     match inst.funct3 {
                         0b000 => {
                             let ret = pc.wrapping_add(4);
-                            asm += &format!(r#"
-                                mov rax, {ret}
-                                {store_rd_from_rax}
 
+                            // the order of stores is a bit odd here, but for an important reason:
+                            // Storing a value into rd, while also loading from that register later
+                            // causes clobbers.
+                            // --> never load after store
+
+                            asm += &format!(r#"
+                                ; We're jumping unconditionally, so update the instruction counter.
+                                add r15, {instructions_in_block}
+
+                                ; Calculate the target address
                                 {load_rax_from_rs1}
                                 add rax, {imm}
+                                mov rdx, rax
 
+                                ; Store the return address in rd
+                                mov rcx, {ret}
+                                {store_rd_from_rcx}
+
+
+                                ; Check if the target lies within JIT bounds.
                                 shr rax, 2
                                 cmp rax, {num_blocks}
                                 jae .jit_resolve
 
+                                ; Check if the relevant JIT block is populated
                                 mov rax, [r14 + rax*8]
                                 test rax, rax
                                 jz .jit_resolve
 
+                                ; If the block is non-zero, jump to it.
                                 jmp rax
 
                                 .jit_resolve:
-                                {load_rdx_from_rs1}
-                                add rdx, {imm}
+                                ; RDX will contain the target address
                                 mov rax, 1
                                 ret
                                 
-                            "#, ret = ret, imm = inst.imm,
+                            "#, ret = ret, imm = inst.imm as i64 as u64,
                                 num_blocks = num_blocks,
-                                store_rd_from_rax = store_reg!(inst.rd, "rax"),
-                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                                load_rdx_from_rs1 = load_reg!("rdx", inst.rs1));
+                                instructions_in_block = instructions_in_block,
+                                store_rd_from_rcx = store_reg!(inst.rd, "rcx"),
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1));
                             break 'next_inst;
                         },
                         _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
@@ -878,6 +1002,7 @@ impl Arch for RiscV {
                         cmp rax, rdx
                         {jmp_type} .fallthrough
 
+                        add r15, {instructions_in_block}
                         mov rax, [r14 + {target}]
                         test rax, rax
                         jz .jit_resolve
@@ -891,6 +1016,7 @@ impl Arch for RiscV {
  
                         .fallthrough:
                     "#, jmp_type = jmp_type,
+                        instructions_in_block = instructions_in_block,
                         target = (target / 4) * 8, target_pc = target,
                         load_rax_from_rs1 = load_reg!("rax", inst.rs1),
                         load_rdx_from_rs2 = load_reg!("rdx", inst.rs2));
@@ -901,18 +1027,26 @@ impl Arch for RiscV {
                     let inst = Itype::from(inst);
 
                     let (load_type, load_size, reg, size) = match inst.funct3 {
-                        0b000 => ("movsx", "byte",  "rax", 1),    // LB : Load byte
-                        0b001 => ("movsx", "word",  "rax", 2),    // LH : Load half word
-                        0b010 => ("movsx", "dword", "rax", 4),    // LW : Load word
-                        0b011 => ("mov",   "qword", "rax", 8),    // LD : Load double word
-                        0b100 => ("movzx", "byte",  "rax", 1),    // LBU: Load byte unsigned.
-                        0b101 => ("movzx", "word",  "rax", 2),    // LHU: Load half word unsigned
-                        0b110 => ("mov",   "dword", "eax", 4),    // LWU: Load word unsigned
+                        0b000 => ("movsx", "byte",  "rdx", 1),    // LB : Load byte
+                        0b001 => ("movsx", "word",  "rdx", 2),    // LH : Load half word
+                        0b010 => ("movsx", "dword", "rdx", 4),    // LW : Load word
+                        0b011 => ("mov",   "qword", "rdx", 8),    // LD : Load double word
+                        0b100 => ("movzx", "byte",  "rdx", 1),    // LBU: Load byte unsigned.
+                        0b101 => ("movzx", "word",  "rdx", 2),    // LHU: Load half word unsigned
+                        0b110 => ("mov",   "dword", "edx", 4),    // LWU: Load word unsigned
                         _ => {panic!("Unknown funct3: {:#03b} in opcode: {:#09b}\n", 
                                      inst.funct3, opcode)},
                     };
 
+                    // Compute a mask that we can use to determine whether all of the bytes
+                    // we're about to read have `READ` perms. (One byte per bit we want to read.)
+                    let mut perm_mask = PERM_READ as u64;
+                    for i in 1..size {
+                        perm_mask |= (PERM_READ as u64) << (i * 8);
+                    }
+
                     asm += &format!(r#"
+                        ; Calculate the load address.
                         {load_rax_from_rs1}
                         add rax, {imm}
 
@@ -920,10 +1054,18 @@ impl Arch for RiscV {
                         cmp rax, {memory_len} - {size}
                         ja .fault
 
-                        ; TODO; Perms check here
-                        jmp .do_load
+                        ; Then check perms
+                        {load_type} {reg}, {load_size} [r9 + rax]
+                        mov rcx, {perm_mask}
+                        ; Overlay the "requested" perm mask over the actual perms,
+                        ; If we are missing any, the result of the AND won't match with the
+                        ; requested mask (rcx)
+                        and rdx, rcx
+                        cmp rdx, rcx
+                        je .do_load
 
                         .fault:
+                        add r15, {instructions_in_block}
                         mov rcx, rax
                         mov rdx, {pc}
                         mov rax, 4
@@ -931,12 +1073,13 @@ impl Arch for RiscV {
                         
                         .do_load:
                         {load_type} {reg}, {load_size} [r8 + rax]
-                        {store_rax_into_rd}
+                        {store_rdx_into_rd}
                     "#, imm = inst.imm,
+                        instructions_in_block = instructions_in_block,
                         load_type = load_type, load_size = load_size, reg = reg,
-                        memory_len = mmu.mem_len(), size = size, pc = pc,
+                        memory_len = mmu.mem_len(), size = size, pc = pc, perm_mask = perm_mask,
                         load_rax_from_rs1 = load_reg!("rax", inst.rs1),
-                        store_rax_into_rd = store_reg!(inst.rd, "rax"));
+                        store_rdx_into_rd = store_reg!(inst.rd, "rdx"));
                 },
                 0b0100011 => {
                     // SX: Store instructions
@@ -958,19 +1101,33 @@ impl Arch for RiscV {
                     // shift an address down by `shamt` to get the block idx.
                     let dirty_block_shamt = DIRTY_BLOCK_SIZE.trailing_zeros();
 
+                    // Compute a mask that we can use to determine whether all of the bytes
+                    // we're about to read have `READ` perms. (One byte per bit we want to read.)
+                    let mut perm_mask = PERM_WRITE as u64;
+                    for i in 1..size {
+                        perm_mask |= (PERM_WRITE as u64) << (i * 8);
+                    }
+
                     asm += &format!(r#"
                         {load_rax_from_rs1}
                         add rax, {imm}
-                        {load_rdx_from_rs2}
 
                         ; Bounds check first
                         cmp rax, {memory_len} - {size}
                         ja .fault
 
-                        ; TODO; Perms check here
-                        jmp .nofault
+                        ; Then check perms
+                        {store_type} {reg}, {store_size} [r9 + rax]
+                        mov rcx, {perm_mask}
+                        ; Overlay the "requested" perm mask over the actual perms,
+                        ; If we are missing any, the result of the AND won't match with the
+                        ; requested mask (rcx)
+                        and rdx, rcx
+                        cmp rdx, rcx
+                        je .nofault
 
                         .fault:
+                        add r15, {instructions_in_block}
                         mov rcx, rax
                         mov rdx, {pc}
                         mov rax, 5
@@ -1000,11 +1157,13 @@ impl Arch for RiscV {
                         inc r12
                         
                         .do_store:
+                        {load_rdx_from_rs2}
                         {store_type} {store_size} [r8 + rax] , {reg}
                     "#, imm = inst.imm,
+                        instructions_in_block = instructions_in_block,
                         dirty_block_shamt = dirty_block_shamt,
                         store_type = store_type, store_size = store_size, reg = reg,
-                        memory_len = mmu.mem_len(), size = size, pc = pc,
+                        memory_len = mmu.mem_len(), size = size, pc = pc, perm_mask = perm_mask,
                         load_rax_from_rs1 = load_reg!("rax", inst.rs1),
                         load_rdx_from_rs2 = load_reg!("rdx", inst.rs2));
                  },
@@ -1264,7 +1423,7 @@ impl Arch for RiscV {
                                 movsx rax, eax
                                 {store_rax_into_rd}
                                 "#,
-                                imm = inst.imm,
+                                imm = inst.imm as i32 as u32,
                                 load_rax_from_rs1 = load_reg!("rax", inst.rs1),
                                 store_rax_into_rd = store_reg!(inst.rd, "rax"));
 
@@ -1420,9 +1579,13 @@ impl Arch for RiscV {
                     } else if inst == 0b00000000000100000000000001110011 {
                         // EBREAK
                         asm += &format!(r#"
-                            mov rax, 3
+                            mov eax, 3
                             mov rdx, {pc}
+                            ; Save a relative address here, so we can return to JIT execution, 
+                            ; while skipping the previous 2 instructions.
+                            lea rcx, [rel .continue]
                             ret
+                            .continue:
                         "#, pc = pc);
                     } else {
                         unreachable!();

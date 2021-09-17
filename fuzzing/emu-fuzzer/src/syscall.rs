@@ -15,11 +15,56 @@ pub fn exit(exit_code: i64) -> Result<i64, VmExit> {
     Err(VmExit::Exit(exit_code))
 }
 
+/// Return the (effective) UID of the emulator user.
+/// -> Assuming 1000 for now
+pub fn getuid() -> Result<i64, VmExit> {
+    Ok(1000)
+}
+
+/// Return the (effective) GID of the emulator user.
+/// -> Assuming 1000 for now
+pub fn getgid() -> Result<i64, VmExit> {
+    Ok(1000)
+}
+
 /// We will never actually close Fd's, but we could invalidate it so we can catch a program
 /// using a closed Fd.  (TODO)
 pub fn close(_fd: i64) -> Result<i64, VmExit> {
     Ok(0)
 }
+
+/// Set pointer to thread id.
+/// TODO; Implement
+pub fn set_tid_address(mmu: &mut Mmu, tidptr: VirtAddr) -> Result<i64, VmExit> {
+    let tid = 0i32;
+    mmu_write!(mmu, tidptr, tid)?;
+    Ok(0)
+}
+
+/// Set pointer to thread id.
+/// TODO; Implement
+pub fn set_robust_list(mmu: &mut Mmu, headprt: VirtAddr, len: i32) -> Result<i64, VmExit> {
+    Ok(-1)
+}
+
+/// Take's a pointer from user space, and fills it with a utsname struct containing some kernel
+/// information.
+/// Returns 0 on success, -1 on failure.
+pub fn uname(mmu: &mut Mmu, p_uname: VirtAddr) -> Result<i64, VmExit> {
+    // sysname, nodename, release, version, machine, (domainname)
+    // Each field is 64+1 bytes in size.
+    let values = ["Linux", "Fuzzy", "5.4.0-84-generic",
+                  "#94-Ubuntu SMP Thu Aug 26 20:27:37 UTC 2021", "riscv64"];
+    let mut buf = [0u8; 65*6];
+    for (idx, value) in values.iter().enumerate() {
+        let addr = 65usize.checked_mul(idx).unwrap();
+        buf[addr..addr+value.len()].copy_from_slice(value.as_bytes());
+    }
+    // Write the buffer in one go, s.t. RAW bits are correctly cleared.
+    mmu.write_from(p_uname, &buf)?;
+    Ok(0)
+}
+
 
 /// Stat a file discriptor, write the result into p_statbuf
 pub fn fstat(mmu: &mut Mmu, file_pool: &FilePool, fd: i64, p_statbuf: VirtAddr) 
@@ -89,7 +134,6 @@ pub fn read(fp: &mut FilePool, mmu: &mut Mmu, fd: i64, p_buf: VirtAddr,
         None => Ok(-1)
     }
 }
-
 
 pub fn lseek(fp: &mut FilePool, fd: i64, offset: i64, whence: i32) -> Result<i64, VmExit> {
     match fp.lseek(fd as usize, offset, whence) {

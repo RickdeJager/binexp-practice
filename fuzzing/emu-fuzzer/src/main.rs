@@ -22,7 +22,10 @@ use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 
 pub const ALLOW_GUEST_PRINT: bool = false;
 pub const ONE_SHOT: bool = false;
-pub const END_EARLY: bool = true;
+
+pub const DO_SNAPSHOT: bool = true;
+pub const END_EARLY: bool = false;
+
 pub const FORCE_INTERPRETER: bool = false;
 
 // I/O settings
@@ -31,11 +34,11 @@ pub const CORPUS_DIR : &str = "./corpus";
 pub const TEST_FILE : &str = "testfile";
 
 // Statistics
-const BATCH_SIZE: usize = 100;
+const BATCH_SIZE: usize = 200;
 const NUM_THREADS: usize = 8;
 
 // Fuzzy tweakables
-const CORRUPTION_AMOUNT: usize = 32;
+const CORRUPTION_AMOUNT: usize = 64;
 
 pub struct Rng(u64);
 
@@ -82,16 +85,25 @@ pub struct Stats {
 }
 
 fn main() {
-    let binary_path = "./riscv/targets/TinyEXIF/tiny_exif";
-//    let binary_path = "./riscv/echo-file";
+    let binary_path = "./riscv/targets/tinyxml2/tiny_xml";
     let corpus_dir  = "./corpus/";
-    let mmu_size    = 1024 * 1024 * 64;
-    let stack_size  = 1024 * 1024 * 32;
+    let mmu_size    = 1024 * 1024 * 8;
+    let stack_size  = 1024 * 1024 * 3;
     let mut memory  = Mmu::new(mmu_size);
-    let entryp = load_elf(binary_path, &mut memory).expect("Failed to parse ELF.");
+
+    // Read input binary from disk.
+    let binary_contents = std::fs::read(binary_path).ok().expect("Failed to find ELF.");
+
+    // Parse the binary, load it into the mmu and find its entrypoint
+    let (entryp, _binary) = load_elf(&binary_contents, &mut memory).expect("Failed to parse ELF.");
+
+
+    ////////////////////////
+    ///// Stack setup
+    ////////////////////////
+
     // Create a stack
     let mut stack = memory.allocate_stack(stack_size).expect("Failed to allocate stack.");
-
 
     /// Push an integer onto the stack
     macro_rules! push_i {
@@ -104,8 +116,28 @@ fn main() {
 
     let argv = vec![binary_path, TEST_FILE];
 
-    push_i!(0u64); // AUXP
-    push_i!(0u64); // ENVP
+    // AUXP is used by the OS to pass in some auxilary values, like pid, randomness (for canary), 
+    // entry point, processor capabilities, ...
+    //
+    // glibc crashes if AT_RANDOM is not set, and canaries are enabled so this is not optional.
+    let randomness = &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 
+                       0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+    let ptr_random = memory.allocate(16).expect("Failed to allocate for AT_RANDOM");
+    memory.write_from(ptr_random, randomness).expect("Failed to write AT_RANDOM");
+    let auxv = [
+        (25u64, ptr_random.0 as u64),   // AT_RANDOM
+    ];
+
+    push_i!(0u64); // End AUXV by setting AT_NULL to 0
+    push_i!(0u64);
+
+    // Setup AUXV with actual key value pairs.
+    for &(num, value) in auxv.iter().rev() {
+        push_i!(value);
+        push_i!(num);
+    }
+
+    push_i!(0u64); // ENVP -> We're using an empty environment for now.
     push_i!(0u64); // ARGV-end
 
     // Create argv from a vec.
@@ -127,15 +159,21 @@ fn main() {
     }
     push_i!(argv.len() as u64); // ARGC
 
+
+    ////////////////////////
+    ///// Emulator setup
+    ////////////////////////
+
     // Create a corpus:
     let corpus = Arc::new(files::Corpus::new(corpus_dir)
                     .expect("Failed to load real file from disk."));
 
-
     let file_pool = files::FilePool::new(corpus);
-    let jit_cache  = Arc::new(JitCache::new(VirtAddr(mmu_size)));
     let mut golden_emu = Emulator::new(Archs::RiscV, memory, file_pool);
-    golden_emu.add_jitcache(jit_cache);
+    if !FORCE_INTERPRETER {
+        let jit_cache  = Arc::new(JitCache::new(VirtAddr(mmu_size)));
+        golden_emu.add_jitcache(jit_cache);
+    }
 
     // Set the emu's entry point
     golden_emu.set_entry(entryp);
@@ -144,21 +182,31 @@ fn main() {
     println!(">>> Entry {:x}", entryp);
     println!(">>> Stack {:x} - {:x}", stack.0-stack_size, stack.0);
 
-    // Pre-run the template emulator until the first `open` call
-    // TODO; * manually obj-dumped for now
-    let start_point = VirtAddr(0x9b19cusize);
-    let end_point = VirtAddr(0x185a4usize);
-    golden_emu.step_until(start_point).expect("Failed to pre-run the golden-emu.");
+    // If we're doing proper snapshot fuzzing, set a start point.
+    if DO_SNAPSHOT {
+        // Pre-run the template emulator until the first `open` call
+        // TODO; * manually obj-dumped for now
+        let start_point = VirtAddr(0x41e4cusize);
+        golden_emu.step_until(start_point).expect("Failed to pre-run the golden-emu.");
+    }
 
+    // Setting an end boundry allows gives us better perf, but possibly misses some crashes.
     if END_EARLY {
+        let end_point = VirtAddr(0x103acusize);
         golden_emu.set_end_of_fuzz_case(end_point);
     }
     
+    // This mode is meant to perform basic smoke tests. It simply runs the binary once and prints
+    // its exit reason to the terminal.
     if ONE_SHOT {
         println!(">>> run: {:x?}", golden_emu.run());
         println!(">>> PC : {:x?}", golden_emu.arch.get_program_counter());
         return;
     }
+
+    ////////////////////////
+    ///// Thread setup
+    ////////////////////////
 
     // Keep track of all threads
     let mut threads = Vec::new();
@@ -190,7 +238,7 @@ fn main() {
         let percent_vm    = stats.vm_cycles.load(Ordering::SeqCst) as f64 / cycles;
         let percent_mut   = stats.mut_cycles.load(Ordering::SeqCst) as f64 / cycles;
         let percent_reset = stats.reset_cycles.load(Ordering::SeqCst) as f64 / cycles;
-        print!("[{:10.3}] Cases {:10} | FCpS {:10.0} | MIpS {:10.3} | Unique Crashes {:5}
+        print!("[{:10.3}] Cases {:10} | FCpS {:10.0} | MIpS {:10.2} | Unique Crashes {:5}
              Reset {:10.4} | Mut  {:10.4} | VM   {:10.4} | \n", 
                elapsed, cases, cases - last_cases, (inst - last_inst) as f64 / 1000000f64, crashes,
                percent_reset, percent_mut, percent_vm);
@@ -221,11 +269,7 @@ fn worker(golden_emu: Arc<Emulator>, thread_id: usize, stats: Arc<Stats>) {
             let it = util::rdtsc();
             
             let ret: (usize, VmExit);
-            if FORCE_INTERPRETER {
-                ret = emu.run_emu();
-            } else {
-                ret = emu.run();
-            }
+            ret = emu.run();
             vm_cycles += util::rdtsc() - it;
 
             let it = util::rdtsc();

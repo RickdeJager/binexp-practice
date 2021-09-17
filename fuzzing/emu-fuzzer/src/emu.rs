@@ -214,19 +214,6 @@ impl Emulator {
         }
     }
 
-
-
-    /// Small helper function to keep the interfacte for run_jit equal to run_emu.
-    /// TODO; probably will restructure this later
-    pub fn run_jit(&mut self) -> (usize, VmExit) {
-        let ret = self.do_run_jit();
-
-        if let Err(e) = ret{
-            return (0, e)
-        }
-        unreachable!("boop");
-    }
-
     /// Run the emulator until it either crashes or exits.
     pub fn run_emu(&mut self) -> (usize, VmExit) {
         for count in 0.. {
@@ -263,11 +250,15 @@ impl Emulator {
     /// JIT exit's appropriately.
     ///
     /// Returns an Err(VmExit) either due to crash or completion.
-    fn do_run_jit(&mut self) -> Result<(), VmExit> {
+    fn run_jit(&mut self) -> (usize, VmExit) {
 
         let mmu       = &mut self.mmu;
         let file_pool = &mut self.file_pool;
         let jit_cache = self.jit_cache.as_ref().unwrap();
+
+        // Keep track of the total number of instructions executed in this JIT run, by this
+        // specific emulator.
+        let mut total_emu_instructions = 0usize;
 
         // Allow the JIT entry point to be overwritten. This is useful for breakpoint / callback
         // handling. This will point to a specific address in host memory.
@@ -282,6 +273,9 @@ impl Emulator {
             let pc       = self.arch.get_program_counter();
             let jit_addr = jit_cache.lookup(VirtAddr(pc as usize));
 
+            // DEBUG
+            //println!("JIT PC {:#x}", pc);
+
             // Get the addresses we need to run the JIT:
             let (mem, perms, dirty, dirty_bitmap) = mmu.jit_addresses();
             let translation_table = jit_cache.translation_table();
@@ -293,7 +287,14 @@ impl Emulator {
                 (None, None) => {
                     // Go through each instruction in the block to emit some x86_64 assembly
                     let asm = self.arch.generate_jit(VirtAddr(pc as usize),
-                                                jit_cache.num_blocks(), mmu, &self.breakpoints)?;
+                                                jit_cache.num_blocks(), mmu, &self.breakpoints);
+                    if let Err(e) = asm {
+                        // If we hit and error during jit generation, exit here.
+                        return (total_emu_instructions, e);
+                    };
+
+                    // We just handled the error case, so we can unwrap here.
+                    let asm = asm.unwrap();
 
                     let asmfn = tmpdir.join(&format!("tmp-{}.asm", thread_id));
                     let binfn = tmpdir.join(&format!("tmp-{}.bin", thread_id));
@@ -330,6 +331,7 @@ impl Emulator {
             let exit_code: u64;
             let reentry  : u64;
             let arg1     : u64;
+            let instr_ex : usize;
 
             unsafe {
 
@@ -345,6 +347,7 @@ impl Emulator {
                 inout("r12") num_dirty_inuse,
                 in("r13") self.arch.get_register_pointer(),
                 in("r14") translation_table,
+                out("r15") instr_ex,
                 // Let rust known what we potentially clobbered.
                 out("rax") exit_code,
                 out("rdx") reentry,
@@ -355,20 +358,46 @@ impl Emulator {
                 // to its backing store.
                 mmu.set_dirty_len(num_dirty_inuse);
             }
+            // Update performance metrics
+            total_emu_instructions += instr_ex;
 
             // DEBUG
             //println!("JIT exited with {:#x}, reentry: {:#x}", exit_code, reentry);
-            match exit_code {
+
+            // Handle the JIT exit code and potentially end the fuzz case
+            let ret = match exit_code {
                 1 => {
                     // Branch decode request, update PC and re-JIT
-                    self.arch.set_program_counter(reentry)
+                    self.arch.set_program_counter(reentry);
+                    Ok(())
                 },
                 2 => {
                     // JIT encountered a syscall. Handle it and reenter.
                     // (We need to set PC first, so a syscall can potentially set PC as well,
                     //  like `sigreturn` for example.)
                     self.arch.set_program_counter(reentry);
-                    self.arch.handle_syscall(mmu, file_pool)?;
+                    self.arch.handle_syscall(mmu, file_pool)
+                },
+                3 => {
+                    // JIT encountered a breakpoint, probably because we injected one.'
+                    // Check if the breakpoint is one of ours, and if so handle the callback.
+                    let mut ret = Ok(());
+                    self.arch.set_program_counter(reentry); // TODO; this can be removed
+
+                    // If all is well, we will jump back into the JIT code, but we need to specify 
+                    // a new entry point so we don't end up in an endless loop of breakpoints 
+                    // and despair. (case we exit, this won't matter)
+                    //
+                    // Keep in mind, this is a "host" address, pointing into the block of jit mem.
+                    overwrite_jit_address = Some(arg1 as usize);
+
+                    if let Some(callback) = self.breakpoints.get(&VirtAddr(reentry as usize)) {
+                        // This callback can potentially stop execution here.
+                        if let Err(e) =  callback(mmu) {
+                            ret = Err(e)
+                        }
+                    }
+                    ret
                 },
                 4 => {
                    // JIT encountered a read fault, let the fuzzer known we crashed.
@@ -380,7 +409,7 @@ impl Emulator {
                    //
                    //   Arg1 contains the offending address
                    self.arch.set_program_counter(reentry);
-                   return Err(VmExit::ReadFault(VirtAddr(arg1 as usize), 1))
+                   Err(VmExit::ReadFault(VirtAddr(arg1 as usize), 1))
                 },
                 5 => {
                    // JIT encountered a write fault, let the fuzzer known we crashed.
@@ -392,20 +421,15 @@ impl Emulator {
                    //
                    //   Arg1 contains the offending address
                    self.arch.set_program_counter(reentry);
-                   return Err(VmExit::ReadFault(VirtAddr(arg1 as usize), 1))
+                   Err(VmExit::ReadFault(VirtAddr(arg1 as usize), 1))
                 },
-                6 => {
-                    // JIT encountered a breakpoint, probably because we injected one.'
-                    // Check if the breakpoint is one of ours, and if so handle the callback.
-                    if let Some(callback) = self.breakpoints.get(&VirtAddr(reentry as usize)) {
-                        // This callback can potentially stop execution here.
-                        callback(mmu)?;
-                    }
-                    // If all is well jump back into the JIT code, but force a new entry point so
-                    // we don't end up in an endless loop of breakpoints and despair.
-                    overwrite_jit_address = Some(arg1 as usize);
-                }
                 x => unimplemented!("JIT Exit code not handled: {}.", x),
+            };
+
+            // If we hit some reason to exit, return and include the number of instructions
+            // executed during this JIT session.
+            if let Err(e) = ret {
+                return (total_emu_instructions, e)
             }
         }
        // Err(VmExit::Exit(-1))

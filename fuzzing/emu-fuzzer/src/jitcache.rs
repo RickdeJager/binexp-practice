@@ -63,6 +63,7 @@ pub struct JitCache {
 // r12 - Dirty index for the dirty list.
 // r13 - Pointer to the emulators register vector.
 // r14 - Pointer to the base of jitcache.blocks.
+// r15 - Number of instructions executed since last JIT exit.
 //
 // RAX -> scratch, return code
 // RBX -> can't be used to return values in inline asm, so we ignore it
@@ -72,11 +73,10 @@ pub struct JitCache {
 // JIT Return code:
 // RAX: 1 -> Branch resolution error (RDX is requested PC)
 // RAX: 2 -> ECALL instruction was hit
-// RAX: 3 -> EBREAK instruction was hit
-// RAX: 4 -> Read fault    -> RDX = pc, RCX = address
-// RAX: 5 -> Write fault   -> RDX = pc, RCX = address
-// RAX: 6 -> ECALL was hit -> RDX = pc, RCX is the address to call to resume execution after the
+// RAX: 3 -> EBREAK was hit -> RDX = pc, RCX is the address to call to resume execution after the
 //                            breakpoint has been handled.
+// RAX: 4 -> Read fault     -> RDX = pc, RCX = address
+// RAX: 5 -> Write fault    -> RDX = pc, RCX = address
 
 impl JitCache {
     pub fn new(max_guest_address: VirtAddr) -> Self {
@@ -95,7 +95,7 @@ impl JitCache {
 
     /// Look up the relevant JIT Address for any given guest addr.
     pub fn lookup(&self, addr: VirtAddr) -> Option<usize> {
-        assert!(addr.0 & 3 == 0, "Unaligned address in JIT lookup.");
+        assert!(addr.0 & 3 == 0, "Unaligned address in JIT lookup. ({:#x})", addr.0);
 
         // If we've already jitted the requested block, return it's address.
         match self.blocks[addr.0 / 4].load(Ordering::SeqCst) {
@@ -117,12 +117,12 @@ impl JitCache {
     /// Update the JIT with a new block of code. Return the address of the newly
     /// added block.
     pub fn add_mapping(&self, addr: VirtAddr, code: &[u8]) -> usize {
-        assert!(addr.0 & 3 == 0, "Unaligned address in JIT addition.");
+        assert!(addr.0 & 3 == 0, "Unaligned address in JIT addition. ({:#x})", addr.0);
 
         // Lock the backing store of the JIT for exclusive access.
         let mut backing_store = self.backing_store.lock().unwrap();
 
-        // With the backing store locked, we can check in another thread already added a
+        // With the backing store locked, we can check if another thread already added a
         // mapping in the main time. If so, return here instead of re-jitting the same block.
         if let Some(existing) = self.lookup(addr) {
             return existing;
@@ -146,7 +146,7 @@ impl JitCache {
         backing_store.1 += code.len();
 
         // DEBUG; Print JIT additions
-        //println!("Added JIT for {:#x} -> {:#x}", addr.0, new_addr);
+        println!("Added JIT for {:#x} -> {:#x}", addr.0, new_addr);
 
         new_addr
     }

@@ -2,14 +2,12 @@ use crate::emu::VmExit;
 use crate::mmu::{Mmu, Perm, VirtAddr};
 use crate::mmu::{PERM_WRITE, PERM_READ, PERM_EXEC};
 
-/// Load an elf, return the entry point on success.
-pub fn load_elf(binary_path: &str, mmu: &mut Mmu) -> Option<u64> {
-    // Read the input file from disk
-    let contents = std::fs::read(binary_path).ok()?;
+/// Load an elf from a slice of bytes, return the entry point on success.
+pub fn load_elf<'a>(contents: &'a [u8], mmu: &'a mut Mmu) -> Option<(u64, goblin::elf::Elf<'a>)> {
 
-    let binary = goblin::elf::Elf::parse(&contents).ok()?;
+    let binary = goblin::elf::Elf::parse(contents).ok()?;
     let entry = binary.entry;
-    for ph in binary.program_headers {
+    for ph in &binary.program_headers {
         match ph.p_type {
             goblin::elf::program_header::PT_LOAD => {
                 let virtaddr    = VirtAddr(ph.p_vaddr as usize);
@@ -51,7 +49,7 @@ pub fn load_elf(binary_path: &str, mmu: &mut Mmu) -> Option<u64> {
         }
     }
 
-    Some(entry)
+    Some((entry, binary))
 }
 
 
