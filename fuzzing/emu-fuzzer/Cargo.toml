@@ -12,6 +12,11 @@ goblin = "0.4"
 # Fast, non-cryptographically secure hashing for deduping
 meowhash = "0.3"
 
+# Lock-free, fast data-scructures, curtosy of gamozolabs:
+# https://github.com/gamozolabs/fuzz_with_emus/tree/master/shared
+aht = { path = "shared/aht" }
+atomicvec = { path = "shared/atomicvec" }
+
 [profile.release]
 #lto = "fat"
 overflow-checks=true
