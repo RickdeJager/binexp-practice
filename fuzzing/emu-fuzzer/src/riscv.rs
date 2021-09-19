@@ -3,8 +3,9 @@ use crate::mmu::{Mmu, Perm, VirtAddr};
 use crate::mmu::{PERM_READ, PERM_EXEC, PERM_WRITE, DIRTY_BLOCK_SIZE};
 
 use crate::syscall;
-use crate::files::FilePool;
+use crate::files::{FilePool, Corpus};
 use crate::util;
+use crate::MAX_INSTRUCTIONS;
 
 use std::convert::TryFrom;
 
@@ -794,19 +795,47 @@ impl Arch for RiscV {
 
     /// Go through and generate the required assembly for a given PC.
     /// This function will return a big x86 assembly string that can be assembled with nasm.
+    /// Along with the nasm string, a set of PC locations is returned as well to indicate which
+    /// PC's are included.
     ///
     /// In case a fault is encountered while emitting assembly, a Err(VmExit) will be returned.
     fn generate_jit(&mut self, pc: VirtAddr, num_blocks: usize, mmu: &mut Mmu,
-                    break_map: &BreakpointMap) -> Result<String, VmExit> {
-        let mut asm = "[bits 64]\n".to_string();
-        let mut pc = pc.0 as u64;
+                    break_map: &BreakpointMap, corpus: &Corpus, file_pool: &FilePool)
+        -> Result<String, VmExit> {
+
+        let mut pc     = pc.0 as u64;
         let mut instructions_in_block = 0u64;
+        let mut asm    = "[bits 64]\n".to_string();
+
+        // Check for a timeout at the beginning of each block.
+        // This should work out, because every jump target was JIT'ed separately, as
+        // our block-level JIT will dupe when jumping into the middle of a block.
+        asm += &format!(r#"
+            cmp r15, {timeout}
+            jb .no_timeout
+
+            mov rax, 6
+            mov rdx, {pc}
+            ret
+
+            .no_timeout:
+        "#, timeout = MAX_INSTRUCTIONS, pc = pc);
 
         'next_inst: loop {
             // Fetch the current instruction
             let addr = VirtAddr(pc as usize);
-            let inst = mmu_read_perms!(mmu, addr, Perm(PERM_EXEC), u32)?;
 
+            // Track the current PC for coverage.
+            // TODO; Have generate-jit return a set or list, and insert them in one go in emu.rs,
+            // This would allow for better decoupling.
+            corpus.code_coverage.entry_or_insert(&VirtAddr(pc as usize), pc as usize, || {
+                // If this PC wasn't seen before, save the input file.
+                corpus.add_input(file_pool.get_file_ref());
+                Box::new(())
+            });
+
+            // Read and decode the next instruction
+            let inst = mmu_read_perms!(mmu, addr, Perm(PERM_EXEC), u32)?;
             let opcode = inst & 0b1111111;
 
             // Add a label to this instruction
@@ -1040,8 +1069,8 @@ impl Arch for RiscV {
 
                     // Compute a mask that we can use to determine whether all of the bytes
                     // we're about to read have `READ` perms. (One byte per bit we want to read.)
-                    let mut perm_mask = PERM_READ as u64;
-                    for i in 1..size {
+                    let mut perm_mask = 0u64;
+                    for i in 0..size {
                         perm_mask |= (PERM_READ as u64) << (i * 8);
                     }
 
@@ -1103,8 +1132,8 @@ impl Arch for RiscV {
 
                     // Compute a mask that we can use to determine whether all of the bytes
                     // we're about to read have `READ` perms. (One byte per bit we want to read.)
-                    let mut perm_mask = PERM_WRITE as u64;
-                    for i in 1..size {
+                    let mut perm_mask = 0u64;
+                    for i in 0..size {
                         perm_mask |= (PERM_WRITE as u64) << (i * 8);
                     }
 
@@ -1118,6 +1147,7 @@ impl Arch for RiscV {
 
                         ; Then check perms
                         {store_type} {reg}, {store_size} [r9 + rax]
+                        mov rbx, rdx; (grab a copy for later use)
                         mov rcx, {perm_mask}
                         ; Overlay the "requested" perm mask over the actual perms,
                         ; If we are missing any, the result of the AND won't match with the
@@ -1134,6 +1164,12 @@ impl Arch for RiscV {
                         ret
 
                         .nofault:
+                        ; Use the RAW mask to set the correct READ bits.
+                        shl rcx, 2
+                        and rbx, rcx
+                        shr rbx, 3
+                        mov rdx, rbx
+                        or {store_size} [r9+ rax], {reg}
                         ; Check if this block is already marked dirty (if not, set it)
                         mov rcx, rax
                         shr rcx, {dirty_block_shamt}
@@ -1187,8 +1223,8 @@ impl Arch for RiscV {
                             // SLTI: Set to one if less than imm
                             asm += &format!(r#"
                                 {load_rax_from_rs1}
-                                xor  edx, edx
-                                cmp  rax, {imm}
+                                xor edx, edx
+                                cmp rax, {imm}
                                 setl dl,
                                 {store_rdx_into_rd}
                             "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
@@ -1199,8 +1235,8 @@ impl Arch for RiscV {
                             // SLTIU: Set to one if less than imm (unsigned)
                             asm += &format!(r#"
                                 {load_rax_from_rs1}
-                                xor  edx, edx
-                                cmp  rax, {imm}
+                                xor edx, edx
+                                cmp rax, {imm}
                                 setb dl,
                                 {store_rdx_into_rd}
                             "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
@@ -1211,7 +1247,7 @@ impl Arch for RiscV {
                             // XORI: Xor RS1 with the immediate
                             asm += &format!(r#"
                                 {load_rax_from_rs1}
-                                xor  rax, {imm}
+                                xor rax, {imm}
                                 {store_rax_into_rd}
                             "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
                                 store_rax_into_rd = store_reg!(inst.rd, "rax"),
@@ -1221,7 +1257,7 @@ impl Arch for RiscV {
                             // ORI: Or RS1 with the immediate
                             asm += &format!(r#"
                                 {load_rax_from_rs1}
-                                or  rax, {imm}
+                                or rax, {imm}
                                 {store_rax_into_rd}
                             "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
                                 store_rax_into_rd = store_reg!(inst.rd, "rax"),
@@ -1231,7 +1267,7 @@ impl Arch for RiscV {
                             // ANDI: AND RS1 with the immediate
                             asm += &format!(r#"
                                 {load_rax_from_rs1}
-                                and  rax, {imm}
+                                and rax, {imm}
                                 {store_rax_into_rd}
                             "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
                                 store_rax_into_rd = store_reg!(inst.rd, "rax"),
@@ -1243,7 +1279,7 @@ impl Arch for RiscV {
                                 0b000000 => {
                                     asm += &format!(r#"
                                         {load_rax_from_rs1}
-                                        shl  rax, {shamt}
+                                        shl rax, {shamt}
                                         {store_rax_into_rd}
                                     "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
                                         store_rax_into_rd = store_reg!(inst.rd, "rax"),
@@ -1260,7 +1296,7 @@ impl Arch for RiscV {
                                     // SRLI: Shift-right logical immediate
                                     asm += &format!(r#"
                                         {load_rax_from_rs1}
-                                        shr  rax, {shamt}
+                                        shr rax, {shamt}
                                         {store_rax_into_rd}
                                     "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
                                         store_rax_into_rd = store_reg!(inst.rd, "rax"),
@@ -1270,7 +1306,7 @@ impl Arch for RiscV {
                                     // SRAI: Shift-right arith immediate
                                     asm += &format!(r#"
                                         {load_rax_from_rs1}
-                                        sar  rax, {shamt}
+                                        sar rax, {shamt}
                                         {store_rax_into_rd}
                                     "#, load_rax_from_rs1 = load_reg!("rax", inst.rs1),
                                         store_rax_into_rd = store_reg!(inst.rd, "rax"),
@@ -1601,10 +1637,7 @@ impl Arch for RiscV {
         // Return the assembly we generated.
         Ok(asm)
     }
-
-
-
-  }
+}
 
 
 struct Utype {

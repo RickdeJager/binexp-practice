@@ -77,6 +77,7 @@ pub struct JitCache {
 //                            breakpoint has been handled.
 // RAX: 4 -> Read fault     -> RDX = pc, RCX = address
 // RAX: 5 -> Write fault    -> RDX = pc, RCX = address
+// RAX: 6 -> Timeout        -> RDX = pc
 
 impl JitCache {
     pub fn new(max_guest_address: VirtAddr) -> Self {
@@ -98,7 +99,7 @@ impl JitCache {
         assert!(addr.0 & 3 == 0, "Unaligned address in JIT lookup. ({:#x})", addr.0);
 
         // If we've already jitted the requested block, return it's address.
-        match self.blocks[addr.0 / 4].load(Ordering::SeqCst) {
+        match self.blocks.get(addr.0 / 4)?.load(Ordering::SeqCst) {
             0 => None,
             x => Some(x),
         }
@@ -146,7 +147,7 @@ impl JitCache {
         backing_store.1 += code.len();
 
         // DEBUG; Print JIT additions
-        println!("Added JIT for {:#x} -> {:#x}", addr.0, new_addr);
+        //println!("Added JIT for {:#x} -> {:#x}", addr.0, new_addr);
 
         new_addr
     }

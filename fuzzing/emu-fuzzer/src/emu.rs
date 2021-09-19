@@ -1,7 +1,9 @@
 use crate::mmu::{Mmu, VirtAddr};
+use crate::Rng;
 use crate::riscv;
 use crate::jitcache::JitCache;
-use crate::files::FilePool;
+use crate::files::{FilePool, Corpus};
+use crate::MAX_INSTRUCTIONS;
 
 use std::sync::Arc;
 use std::process::Command;
@@ -33,7 +35,8 @@ pub trait Arch {
     fn fork(&self) -> Box<dyn Arch + Send + Sync>;
 
     fn generate_jit(&mut self, pc: VirtAddr, num_blocks: usize, mmu: &mut Mmu, 
-                    break_map: &BreakpointMap) -> Result<String, VmExit>;
+                    break_map: &BreakpointMap, corpus: &Corpus, file_pool: &FilePool)
+        -> Result<String, VmExit>;
 
     fn handle_syscall(&mut self, mmu: &mut Mmu, file_pool: &mut FilePool) -> Result<(), VmExit>;
 }
@@ -51,6 +54,9 @@ pub enum VmExit {
     /// than guest behaviour.
     Meta,
 
+    /// We hit the maximum number of fuzz cases allowed before hitting another exit reason.
+    TimeOut,
+
     /// Calling this Syscall would trigger an integer overflow.
     SyscallIntegerOverflow,
 
@@ -59,6 +65,9 @@ pub enum VmExit {
 
     /// A Read fault occured at `addr` with `length`.
     ReadFault(VirtAddr, usize),
+
+    /// The VM tried to decode NX memory at `addr` with `length` as an executable instruction.
+    ExecFault(VirtAddr, usize),
 
     /// A Write fault occured at `addr` with `length`.
     WriteFault(VirtAddr, usize),
@@ -77,9 +86,9 @@ impl VmExit {
     /// Helper function to add some structure to crash definitions
     pub fn is_crash(self) -> Option<(FaultType, VirtAddrType)> {
         match self {
-            VmExit::ReadFault(addr, _) => Some((FaultType::Read, addr.into())),
-            VmExit::WriteFault(addr, _) => Some((FaultType::Write, addr.into())),
-       //     VmExit::ExecFault(addr, _) => Some((FaultType::Exec, addr.into())),
+            VmExit::ReadFault(addr, _)   => Some((FaultType::Read, addr.into())),
+            VmExit::WriteFault(addr, _)  => Some((FaultType::Write, addr.into())),
+            VmExit::ExecFault(addr, _)   => Some((FaultType::Exec, addr.into())),
             VmExit::AddressMiss(addr, _) => Some((FaultType::Bounds, addr.into())),
             _ => None,
         }
@@ -99,7 +108,7 @@ pub enum FaultType {
 
 
 /// Distinguish between different types of addresses for crash deduping
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VirtAddrType {
     // Address is literally null
     NullAddr,
@@ -137,6 +146,9 @@ pub struct Emulator {
     /// The file pool from which this emulator can pull files.
     pub file_pool: FilePool,
 
+    /// A corpus ref containing all files, and derived files based on coverage/crashes
+    pub corpus: Arc<Corpus>,
+
     /// (Optional) Reference to shared JIT cache
     pub jit_cache: Option<Arc<JitCache>>,
 
@@ -153,13 +165,14 @@ fn end_of_fuzz_case(_: &mut Mmu) -> Result<(), VmExit> {
 
 impl Emulator {
     /// Create a new emulator, using a predefined block of memory and a stack size.
-    pub fn new(chosen_arch: Archs, mem: Mmu, file_pool: FilePool) -> Self {
+    pub fn new(chosen_arch: Archs, mem: Mmu, corpus: Arc<Corpus>) -> Self {
         match chosen_arch {
             Archs::RiscV => {
                 Emulator{
                     arch       : riscv::RiscV::new(),
                     mmu        : mem,
-                    file_pool  : file_pool,
+                    file_pool  : FilePool::new(),
+                    corpus     : corpus,
                     jit_cache  : None,
                     breakpoints: BTreeMap::new(),
                 }
@@ -178,6 +191,7 @@ impl Emulator {
             arch       : self.arch.fork(),
             mmu        : self.mmu.fork(),
             file_pool  : self.file_pool.clone(),
+            corpus     : self.corpus.clone(),
             jit_cache  : self.jit_cache.clone(),
             breakpoints: self.breakpoints.clone(),
         }
@@ -216,16 +230,21 @@ impl Emulator {
 
     /// Run the emulator until it either crashes or exits.
     pub fn run_emu(&mut self) -> (usize, VmExit) {
-        for count in 0.. {
-            //let pc = self.arch.get_program_counter();
-            //println!("PC: {:#x}", pc);
+        for count in 0..MAX_INSTRUCTIONS {
+            // Track coverage
+            let pc = self.arch.get_program_counter() as usize;
+            self.corpus.code_coverage.entry_or_insert(&VirtAddr(pc), pc, || {
+                // If this PC wasn't seen before, save the input file.
+                self.corpus.add_input(self.file_pool.get_file_ref());
+                Box::new(())
+            });
             if let Err(exit) = self.tick() {
                 // DEBUG
                 return (count, exit);
             }
         }
-        // Did I just solve the halting problem?
-        unreachable!();
+
+        return (MAX_INSTRUCTIONS, VmExit::TimeOut)
     }
 
     /// Single step forwards until the emulator is sat at the required instruction.
@@ -244,6 +263,11 @@ impl Emulator {
     /// Specify an address where we want to end this fuzz case.
     pub fn set_end_of_fuzz_case(&mut self, addr: VirtAddr) {
         assert!(self.breakpoints.insert(addr, end_of_fuzz_case).is_none());
+    }
+
+    /// Prepare the emulator for its next fuzz case, and optionally add some corruption.
+    pub fn randomize(&mut self, rng: &mut Rng, max_tweaks: usize) {
+        self.file_pool.randomize(rng, max_tweaks, &*self.corpus);
     }
 
     /// This functions keeps the JIT choochin' by invoking nasm when needed, and handling
@@ -286,15 +310,19 @@ impl Emulator {
                 // have to generate some new assembly and JIT it.
                 (None, None) => {
                     // Go through each instruction in the block to emit some x86_64 assembly
-                    let asm = self.arch.generate_jit(VirtAddr(pc as usize),
-                                                jit_cache.num_blocks(), mmu, &self.breakpoints);
-                    if let Err(e) = asm {
+                    let jit_ret = self.arch.generate_jit(VirtAddr(pc as usize), 
+                                                         jit_cache.num_blocks(), mmu,
+                                                         &self.breakpoints, &*self.corpus,
+                                                         &file_pool);
+                    if let Err(e) = jit_ret {
                         // If we hit and error during jit generation, exit here.
                         return (total_emu_instructions, e);
                     };
 
                     // We just handled the error case, so we can unwrap here.
-                    let asm = asm.unwrap();
+                    let asm = jit_ret.unwrap();
+                    // For easier debugging, remove the indentation.
+                    let asm = str::replace(&asm, "  ", "");
 
                     let asmfn = tmpdir.join(&format!("tmp-{}.asm", thread_id));
                     let binfn = tmpdir.join(&format!("tmp-{}.bin", thread_id));
@@ -331,7 +359,6 @@ impl Emulator {
             let exit_code: u64;
             let reentry  : u64;
             let arg1     : u64;
-            let instr_ex : usize;
 
             unsafe {
 
@@ -347,7 +374,7 @@ impl Emulator {
                 inout("r12") num_dirty_inuse,
                 in("r13") self.arch.get_register_pointer(),
                 in("r14") translation_table,
-                out("r15") instr_ex,
+                inout("r15") total_emu_instructions,
                 // Let rust known what we potentially clobbered.
                 out("rax") exit_code,
                 out("rdx") reentry,
@@ -358,8 +385,6 @@ impl Emulator {
                 // to its backing store.
                 mmu.set_dirty_len(num_dirty_inuse);
             }
-            // Update performance metrics
-            total_emu_instructions += instr_ex;
 
             // DEBUG
             //println!("JIT exited with {:#x}, reentry: {:#x}", exit_code, reentry);
@@ -423,6 +448,11 @@ impl Emulator {
                    self.arch.set_program_counter(reentry);
                    Err(VmExit::ReadFault(VirtAddr(arg1 as usize), 1))
                 },
+                6 => {
+                   // JIT encountered a write timeout, we decide to end the fuzz case here.
+                   self.arch.set_program_counter(reentry);
+                   Err(VmExit::TimeOut)
+                },
                 x => unimplemented!("JIT Exit code not handled: {}.", x),
             };
 
@@ -434,7 +464,5 @@ impl Emulator {
         }
        // Err(VmExit::Exit(-1))
     }
-
-
 }
 

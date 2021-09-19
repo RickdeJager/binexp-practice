@@ -190,6 +190,11 @@ impl Mmu {
         // Get the current allocation base
         let base = self.cur_alloc;
 
+        // If alloc is called on null, just return the current base right away.
+        if size == 0 {
+            return Some(base);
+        }
+
         // Update the allocation size (check for overflow)
         self.cur_alloc = VirtAddr(self.cur_alloc.0.checked_add(size)?);
 
@@ -200,8 +205,8 @@ impl Mmu {
 
         // Mark the new memory as uninitialized and writable.
         // TODO;
-        //self.set_permissions(base, size, Perm(PERM_RAW | PERM_WRITE));
-        self.set_permissions(base, size, Perm(PERM_READ | PERM_WRITE));
+        self.set_permissions(base, size, Perm(PERM_RAW | PERM_WRITE));
+        //self.set_permissions(base, size, Perm(PERM_READ | PERM_WRITE));
 
         Some(base)
     }
@@ -221,8 +226,8 @@ impl Mmu {
 
         // Mark the new memory as uninitialized and writable.
         // TODO;
-        //self.set_permissions(base, size, Perm(PERM_RAW | PERM_WRITE));
-        self.set_permissions(base, size, Perm(PERM_READ | PERM_WRITE));
+        self.set_permissions(base, size, Perm(PERM_RAW | PERM_WRITE));
+        //self.set_permissions(base, size, Perm(PERM_READ | PERM_WRITE));
 
         // Save the bottom of the stack
         self.stack_location = base;
@@ -312,6 +317,10 @@ impl Mmu {
         // If we attempt to read a byte that lacks some of the required permissions,
         // return an error.
         if perms.iter().any(|x| (x.0 & perm.0) != perm.0) {
+            // Check if the requested perm contained EXEC, if so return a ExecFault Instead.
+            if perm.0 & PERM_EXEC != 0 {
+                return Err(VmExit::ExecFault(addr, buf.len()));
+            }
             return Err(VmExit::ReadFault(addr, buf.len()));
         }
 

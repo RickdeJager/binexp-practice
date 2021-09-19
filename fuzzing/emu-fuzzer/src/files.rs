@@ -2,13 +2,16 @@
 /// struct that holds files from the corpus.
 
 use std::fs;
-use std::sync::{Arc, Mutex};
-use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+use std::collections::HashMap;
 use meowhash::MeowHasher;
+use aht::Aht;
+use atomicvec::AtomicVec;
 
 use crate::Rng;
 use crate::emu::{FaultType, VirtAddrType};
-use crate::TEST_FILE;
+use crate::mmu::VirtAddr;
+use crate::{TEST_FILE, SWAP_RATE};
 
 pub const SEEK_SET: i32 = 0;
 pub const SEEK_CUR: i32 = 1;
@@ -183,9 +186,6 @@ struct Fd {
 
 #[derive(Clone)]
 pub struct FilePool {
-    /// A corpus ref containing all files, and derived files based on coverage/crashes
-    corpus: Arc<Corpus>,
-
     /// A Hashmap of all files available within this FilePool.
     file_map: HashMap<String, File>,
 
@@ -194,22 +194,18 @@ pub struct FilePool {
 
     /// The currently "selected" file, aka a file from the file map that we are mutating.
     selected: File,
-
 }
 
 impl FilePool {
 
     /// Add dummy files for STDIN/STDOUT/STDERR, Pick an initial file from the corpus,
     /// and add it to the file_pool
-    pub fn new(corpus: Arc<Corpus>) -> Self{
+    pub fn new() -> Self{
         let mut ret = FilePool {
-            corpus: corpus.clone(),
             file_map: HashMap::new(),
             open_fds: Vec::new(),
-            // TODO; Replace with Option
             selected: File {
-                // TODO; Yuk
-                contents: (*corpus).inputs.lock().unwrap()[0].clone(),
+                contents: Vec::new(),
                 tweak:    Vec::new(),
                 stat:     Stat::new(),
              },
@@ -242,22 +238,25 @@ impl FilePool {
         Some(self.selected.contents.to_vec())
     }
 
+    /// Get a reference to the (potentially modified) currently selected file.
+    pub fn get_file_ref(&self) -> &[u8] {
+        &self.selected.contents
+    }
+
     /// Pick a new random file from the corpus and copy it over to the active file pool.
     /// If we "randomly" pick the same file, reset it instead.
     ///
     /// We will apply some significant bias to staying w/ the same file, as it avoids an
     /// expensive clone action.
-    pub fn randomize(&mut self, rng: &mut Rng, max_tweaks: usize) {
+    pub fn randomize(&mut self, rng: &mut Rng, max_tweaks: usize, corpus: &Corpus) {
 
-        // Every one in 20 cases we swap files.
+        // Every one in X cases we swap files.
         // This is kinda costly, as we're doing a full copy.
         // TODO; Just cache the entire corpus in mem and never clone?
-        if rng.rand() % 20  == 0 {
+        if rng.rand() % SWAP_RATE  == 0  || self.selected.contents.is_empty() {
             // Pick a new file and copy the contents.
-            // TODO; Move to RWLock
-            let corpus_inputs = (*self.corpus).inputs.lock().unwrap();
-            let idx = rng.rand() % corpus_inputs.len();
-            self.selected.contents = corpus_inputs[idx].clone();
+            let idx = rng.rand() % corpus.inputs.len();
+            self.selected.contents = corpus.inputs.get(idx).unwrap().clone();
         } else {
             // Otherwise, remove the current tweak.
             self.selected.remove_tweak();
@@ -359,17 +358,6 @@ impl FilePool {
             _ => Some(-1),
         }
     }
-
-    /// Small helper function to add a new crash to both the crashes and input sets.
-    pub fn add_crash(&mut self, contents: &Vec<u8>, ip: u64, reason: &(FaultType, VirtAddrType)) 
-        -> bool {
-        if self.corpus.add_crash(contents, ip, reason) {
-            // If the crash was truly unique, also add it to the inputs
-            self.corpus.add_input(contents.clone());
-            return true;
-        }
-        false
-    }
 }
 
 
@@ -377,67 +365,79 @@ impl FilePool {
 pub struct Corpus {
 
     /// A Simple hashset to dedupe the inputs
-    input_hashes: Mutex<HashSet<u128>>,
+    input_hashes: Aht<u128, (), 1048576>,
 
     /// Vector containing all inputs as vec's of u8's
-    pub inputs: Mutex<Vec<Vec<u8>>>,
+    pub inputs: AtomicVec<Vec<u8>, 1048576>,
 
     /// A Simple hashset to dedupe crashes. This is not based on the actual contents,
     /// but rather on the crashes' metadata like, program counter, crash type, ...
-    crash_hashes: Mutex<HashSet<u128>>,
+    crash_hashes: Aht<(VirtAddr, FaultType, VirtAddrType), (), 1048576>,
 
     /// Vector containing all unique crashes
     pub crashes: Mutex<Vec<Vec<u8>>>,
+
+    /// A set off all PC's that can were covered by the current corpus
+    pub code_coverage: Aht<VirtAddr, (), 1048576>,
+
 }
 
 impl Corpus {
     /// Populate the corpus from a specified directory.
     pub fn new(corpus_dir: &str) -> Option<Self> {
         let corpus = Corpus{
-            input_hashes: Mutex::new(HashSet::new()),
-            inputs      : Mutex::new(Vec::new()),
-            crash_hashes: Mutex::new(HashSet::new()),
-            crashes     : Mutex::new(Vec::new()),
+            input_hashes : Aht::new(),
+            inputs       : AtomicVec::new(),
+            crash_hashes : Aht::new(),
+            crashes      : Mutex::new(Vec::new()),
+            code_coverage: Aht::new(),
         };
 
         // Load the initial corpus by grabbing all files in the directory.
         for file_name in fs::read_dir(corpus_dir).ok()? {
             let contents = std::fs::read(file_name.unwrap().path()).ok()?;
-            corpus.add_input(contents);
+            corpus.add_input(&contents);
         }
         Some(corpus)
     }
 
     /// Add a new file to the Corpus, given its contents as a u8 vec.
-    pub fn add_input(&self, contents: Vec<u8>) -> bool {
+    pub fn add_input(&self, contents: &[u8]) -> bool {
+        let mut ret = false;
         // Use a fast non-cryptographically secure hash for dedupe.
-        // TODO; This first lock can be released a bit earlier
-        let mut input_hashes = self.input_hashes.lock().unwrap();
-        if input_hashes.insert(MeowHasher::hash(&contents).as_u128()) {
+        let hash = MeowHasher::hash(contents).as_u128();
+        self.input_hashes.entry_or_insert(&hash, hash as usize, || {
             // Insert to files vec if the hash wasn't present yet.
-            let mut inputs = self.inputs.lock().unwrap();
-            inputs.push(contents);
-            return true;
-        }
-        false
+            self.inputs.push(Box::new(contents.to_vec()));
+            ret = true;
+            Box::new(())
+        });
+        ret
     }
 
     /// Add a crashing input to both the input set we are pulling from, as well
     /// as the crash set we'll be saving to disk.
-    pub fn add_crash(&self, contents: &Vec<u8>, ip: u64, reason: &(FaultType, VirtAddrType)) 
-            -> bool {
-        // Use a fast non-cryptographically secure hash for dedupe.
-        // TODO; fix hash
-        let hash = MeowHasher::hash(&format!("{}{:?}", ip, reason).as_bytes()).as_u128();
+    pub fn add_crash(&self, contents: &[u8], ip: u64, reason: &(FaultType, VirtAddrType))
+        -> bool {
 
-        let mut crash_hashes = self.crash_hashes.lock().unwrap();
-        if crash_hashes.insert(hash) {
+        let ip = ip as usize;
+        let mut ret = false;
+        self.crash_hashes.entry_or_insert(&(VirtAddr(ip), reason.0, reason.1), ip, || {
             // Insert to files vec if the hash wasn't present yet.
-            let mut crashes = self.crashes.lock().unwrap();
-            crashes.push(contents.clone());
-            return true;
-        }
-        false
+            // TODO; This should ideally also be using an atomic vec, but this case is fairly rare,
+            // so this is fine for now.
+            {
+                let mut crashes = self.crashes.lock().unwrap();
+                crashes.push(contents.to_vec());
+            }
+
+            // Also add the crash to our input set.
+            self.add_input(contents);
+
+            ret = true;
+            Box::new(())
+        });
+        ret
     }
 }
 

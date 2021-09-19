@@ -13,6 +13,7 @@ mod jitcache;
 use std::fs;
 use mmu::{Mmu, VirtAddr};
 use emu::{Emulator, Archs, FaultType, VirtAddrType, VmExit};
+use files::Corpus;
 use util::load_elf;
 use jitcache::JitCache;
 
@@ -24,7 +25,8 @@ pub const ALLOW_GUEST_PRINT: bool = false;
 pub const ONE_SHOT: bool = false;
 
 pub const DO_SNAPSHOT: bool = true;
-pub const END_EARLY: bool = false;
+pub const END_EARLY: bool = true;
+pub const MAX_INSTRUCTIONS: usize = 5_000_000;
 
 pub const FORCE_INTERPRETER: bool = false;
 
@@ -34,11 +36,12 @@ pub const CORPUS_DIR : &str = "./corpus";
 pub const TEST_FILE : &str = "testfile";
 
 // Statistics
-const BATCH_SIZE: usize = 200;
-const NUM_THREADS: usize = 8;
+const BATCH_SIZE: usize = 80;
+const NUM_THREADS: usize = 4;
 
 // Fuzzy tweakables
-const CORRUPTION_AMOUNT: usize = 64;
+const CORRUPTION_AMOUNT: usize = 16;
+const SWAP_RATE: usize = 1;
 
 pub struct Rng(u64);
 
@@ -85,7 +88,7 @@ pub struct Stats {
 }
 
 fn main() {
-    let binary_path = "./riscv/targets/tinyxml2/tiny_xml";
+    let binary_path = "./riscv/targets/TinyEXIF/tiny_exif";
     let corpus_dir  = "./corpus/";
     let mmu_size    = 1024 * 1024 * 8;
     let stack_size  = 1024 * 1024 * 3;
@@ -165,11 +168,13 @@ fn main() {
     ////////////////////////
 
     // Create a corpus:
-    let corpus = Arc::new(files::Corpus::new(corpus_dir)
+    let corpus = Arc::new(Corpus::new(corpus_dir)
                     .expect("Failed to load real file from disk."));
 
-    let file_pool = files::FilePool::new(corpus);
-    let mut golden_emu = Emulator::new(Archs::RiscV, memory, file_pool);
+    let mut golden_emu = Emulator::new(Archs::RiscV, memory, corpus.clone());
+    // TODO; this is gross. (We need to select an initial file for pre-run or one-shot)
+    golden_emu.randomize(&mut Rng::new(0), CORRUPTION_AMOUNT);
+
     if !FORCE_INTERPRETER {
         let jit_cache  = Arc::new(JitCache::new(VirtAddr(mmu_size)));
         golden_emu.add_jitcache(jit_cache);
@@ -186,13 +191,13 @@ fn main() {
     if DO_SNAPSHOT {
         // Pre-run the template emulator until the first `open` call
         // TODO; * manually obj-dumped for now
-        let start_point = VirtAddr(0x41e4cusize);
+        let start_point = VirtAddr(0x9b19cusize);
         golden_emu.step_until(start_point).expect("Failed to pre-run the golden-emu.");
     }
 
     // Setting an end boundry allows gives us better perf, but possibly misses some crashes.
     if END_EARLY {
-        let end_point = VirtAddr(0x103acusize);
+        let end_point = VirtAddr(0x185a4usize);
         golden_emu.set_end_of_fuzz_case(end_point);
     }
     
@@ -233,15 +238,17 @@ fn main() {
         let cases = stats.fuzz_cases.load(Ordering::SeqCst);
         let inst = stats.instructions.load(Ordering::SeqCst);
         let crashes = stats.crashes.load(Ordering::SeqCst);
+        // Grab coverage information, but keep the lock length to a minimum.
+        let coverage = corpus.code_coverage.len();
 
         let cycles        = stats.total_cycles.load(Ordering::SeqCst) as f64;
         let percent_vm    = stats.vm_cycles.load(Ordering::SeqCst) as f64 / cycles;
         let percent_mut   = stats.mut_cycles.load(Ordering::SeqCst) as f64 / cycles;
         let percent_reset = stats.reset_cycles.load(Ordering::SeqCst) as f64 / cycles;
-        print!("[{:10.3}] Cases {:10} | FCpS {:10.0} | MIpS {:10.2} | Unique Crashes {:5}
-             Reset {:10.4} | Mut  {:10.4} | VM   {:10.4} | \n", 
+        print!("\n[{:10.3}] Cases {:10} | FCpS {:10.0} | MIpS {:10.2} | Unique Crashes {:5}
+             Reset {:10.4} | Mut  {:10.4} | VM   {:10.4} | Cov            {:5}\n", 
                elapsed, cases, cases - last_cases, (inst - last_inst) as f64 / 1000000f64, crashes,
-               percent_reset, percent_mut, percent_vm);
+               percent_reset, percent_mut, percent_vm, coverage);
 
         last_inst  = inst;
         last_cases = cases;
@@ -263,7 +270,7 @@ fn worker(golden_emu: Arc<Emulator>, thread_id: usize, stats: Arc<Stats>) {
 
         for _ in 0..BATCH_SIZE {
             let it = util::rdtsc();
-            emu.file_pool.randomize(&mut rng, CORRUPTION_AMOUNT);
+            emu.randomize(&mut rng, CORRUPTION_AMOUNT);
             mut_cycles += util::rdtsc() - it;
             
             let it = util::rdtsc();
@@ -304,8 +311,7 @@ fn crash_handler(emu: &mut Emulator, reason: &(FaultType, VirtAddrType)) -> usiz
     let crash_file = emu.file_pool.dump().unwrap();
 
     // Determine whether this crash is "unique"
-    if emu.file_pool.add_crash(&crash_file, ip, reason) {
-
+    if emu.corpus.add_crash(&crash_file, ip, reason) {
         // If so, write the crash file to disk
         let output_path = format!("./{}/crash-at-{:x}-with-{:x?}", CRASHES_DIR, ip, reason);
         fs::write(output_path, &crash_file).expect("Failed to write crash file.");
