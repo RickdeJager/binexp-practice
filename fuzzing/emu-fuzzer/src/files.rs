@@ -109,20 +109,20 @@ impl File {
                 // Decide how to mutate based on RNG
                 match rng.rand() % 100  {
                     // XOR
-                    0..=66 => {
+                    0..=80 => {
                         *tt  = TweakType::XOR;
                         *idx = rng.rand() % file_len;
-                        if rng.rand() % 2 == 0 {
-                            // Flip a single bit
-                            *val = 1u8 << (rng.rand() % 8) as u8;
-                        } else {
+                        if rng.rand() % 5 == 0 {
                             // Flip multiple bits
                             *val = (rng.rand() % 256) as u8;
+                        } else {
+                            // Flip a single bit
+                            *val = 1u8 << (rng.rand() % 8) as u8;
                         }
                     },
 
                     // SET1
-                    67..=99 => {
+                    81..=99 => {
                         *tt  = TweakType::SET1;
                         *idx = rng.rand() % file_len;
                         *val = MAGIC_LIST_1[rng.rand() % MAGIC_LIST_1.len()];
@@ -309,7 +309,8 @@ impl FilePool {
         }
 
         if fd_num <= 2 {
-            unimplemented!("read a special file");
+            println!("[warn] read a special file (fd: {})", fd_num);
+            return None;
         }
 
         let fd = &self.open_fds[fd_num];

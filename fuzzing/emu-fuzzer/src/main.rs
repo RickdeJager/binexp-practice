@@ -21,14 +21,18 @@ use std::time::{Duration, Instant};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 
+pub const DEBUG_MODE: bool = false;
+
 pub const ALLOW_GUEST_PRINT: bool = false;
 pub const ONE_SHOT: bool = false;
 
 pub const DO_SNAPSHOT: bool = true;
 pub const END_EARLY: bool = true;
-pub const MAX_INSTRUCTIONS: usize = 5_000_000;
+pub const MAX_INSTRUCTIONS: usize = 40_000_000;
 
 pub const FORCE_INTERPRETER: bool = false;
+pub const HOOK_ALLOCATIONS : bool = true;
+pub const ENABLE_RAW_PERM  : bool = false;
 
 // I/O settings
 pub const CRASHES_DIR: &str = "./crashes";
@@ -36,11 +40,11 @@ pub const CORPUS_DIR : &str = "./corpus";
 pub const TEST_FILE : &str = "testfile";
 
 // Statistics
-const BATCH_SIZE: usize = 80;
-const NUM_THREADS: usize = 4;
+const BATCH_SIZE: usize = 40;
+const NUM_THREADS: usize = 8;
 
 // Fuzzy tweakables
-const CORRUPTION_AMOUNT: usize = 16;
+const CORRUPTION_AMOUNT: usize = 46;
 const SWAP_RATE: usize = 1;
 
 pub struct Rng(u64);
@@ -83,22 +87,25 @@ pub struct Stats {
     /// Total number of crashes
     crashes: AtomicUsize,
 
+    /// Number of deduped, unique crashes
+    unique_crashes: AtomicUsize,
+
     /// Total number of instructions executed
     instructions: AtomicUsize,
 }
 
 fn main() {
-    let binary_path = "./riscv/targets/TinyEXIF/tiny_exif";
+    let binary_path = "./riscv/targets/dr_libs/dr_flac";
     let corpus_dir  = "./corpus/";
-    let mmu_size    = 1024 * 1024 * 8;
-    let stack_size  = 1024 * 1024 * 3;
+    let mmu_size    = 1024 * 1024 * 20;
+    let stack_size  = 1024 * 1024 * 5;
     let mut memory  = Mmu::new(mmu_size);
 
     // Read input binary from disk.
     let binary_contents = std::fs::read(binary_path).ok().expect("Failed to find ELF.");
 
     // Parse the binary, load it into the mmu and find its entrypoint
-    let (entryp, _binary) = load_elf(&binary_contents, &mut memory).expect("Failed to parse ELF.");
+    let (entryp, symbols) = load_elf(&binary_contents, &mut memory).expect("Failed to parse ELF.");
 
 
     ////////////////////////
@@ -117,7 +124,6 @@ fn main() {
         }
     }
 
-    let argv = vec![binary_path, TEST_FILE];
 
     // AUXP is used by the OS to pass in some auxilary values, like pid, randomness (for canary), 
     // entry point, processor capabilities, ...
@@ -143,6 +149,7 @@ fn main() {
     push_i!(0u64); // ENVP -> We're using an empty environment for now.
     push_i!(0u64); // ARGV-end
 
+    let argv = vec![binary_path, TEST_FILE];
     // Create argv from a vec.
     for &item in argv.iter().rev() {
         let tmp = item.as_bytes();
@@ -171,7 +178,7 @@ fn main() {
     let corpus = Arc::new(Corpus::new(corpus_dir)
                     .expect("Failed to load real file from disk."));
 
-    let mut golden_emu = Emulator::new(Archs::RiscV, memory, corpus.clone());
+    let mut golden_emu = Emulator::new(Archs::RiscV, memory, corpus.clone(), &symbols);
     // TODO; this is gross. (We need to select an initial file for pre-run or one-shot)
     golden_emu.randomize(&mut Rng::new(0), CORRUPTION_AMOUNT);
 
@@ -191,13 +198,14 @@ fn main() {
     if DO_SNAPSHOT {
         // Pre-run the template emulator until the first `open` call
         // TODO; * manually obj-dumped for now
-        let start_point = VirtAddr(0x9b19cusize);
+        //let start_point = VirtAddr(0x9b19cusize);
+        let start_point = *symbols.get("_open_r").unwrap();
         golden_emu.step_until(start_point).expect("Failed to pre-run the golden-emu.");
     }
 
     // Setting an end boundry allows gives us better perf, but possibly misses some crashes.
     if END_EARLY {
-        let end_point = VirtAddr(0x185a4usize);
+        let end_point = *symbols.get("end_of_fuzz_case").unwrap();
         golden_emu.set_end_of_fuzz_case(end_point);
     }
     
@@ -238,6 +246,7 @@ fn main() {
         let cases = stats.fuzz_cases.load(Ordering::SeqCst);
         let inst = stats.instructions.load(Ordering::SeqCst);
         let crashes = stats.crashes.load(Ordering::SeqCst);
+        let unique_crashes = stats.unique_crashes.load(Ordering::SeqCst);
         // Grab coverage information, but keep the lock length to a minimum.
         let coverage = corpus.code_coverage.len();
 
@@ -245,10 +254,10 @@ fn main() {
         let percent_vm    = stats.vm_cycles.load(Ordering::SeqCst) as f64 / cycles;
         let percent_mut   = stats.mut_cycles.load(Ordering::SeqCst) as f64 / cycles;
         let percent_reset = stats.reset_cycles.load(Ordering::SeqCst) as f64 / cycles;
-        print!("\n[{:10.3}] Cases {:10} | FCpS {:10.0} | MIpS {:10.2} | Unique Crashes {:5}
-             Reset {:10.4} | Mut  {:10.4} | VM   {:10.4} | Cov            {:5}\n", 
+        print!("\n[{:10.3}] Cases {:10} | FCpS {:10.0} | MIpS {:10.2} | Crashes {:10} | Unique Crashes {:5}
+             Reset {:10.4} | Mut  {:10.4} | VM   {:10.4} | Cov          {:5}\n", 
                elapsed, cases, cases - last_cases, (inst - last_inst) as f64 / 1000000f64, crashes,
-               percent_reset, percent_mut, percent_vm, coverage);
+               unique_crashes, percent_reset, percent_mut, percent_vm, coverage);
 
         last_inst  = inst;
         last_cases = cases;
@@ -263,6 +272,7 @@ fn worker(golden_emu: Arc<Emulator>, thread_id: usize, stats: Arc<Stats>) {
     loop {
         let mut instructions = 0usize;
         let mut crashes = 0usize;
+        let mut unique_crashes = 0usize;
         let mut reset_cycles = 0u64;
         let mut vm_cycles = 0u64;
         let mut mut_cycles = 0u64;
@@ -277,13 +287,16 @@ fn worker(golden_emu: Arc<Emulator>, thread_id: usize, stats: Arc<Stats>) {
             
             let ret: (usize, VmExit);
             ret = emu.run();
+            // DEBUG
+            //println!("ret: {:?}", ret);
             vm_cycles += util::rdtsc() - it;
 
             let it = util::rdtsc();
             instructions += ret.0;
             // TODO; Check for syscall not implemented
             if let Some(reason) = ret.1.is_crash() {
-                crashes += crash_handler(&mut emu, &reason);
+                crashes += 1;
+                unique_crashes += crash_handler(&mut emu, &reason);
             }
 
             emu.reset(&golden_emu);
@@ -292,6 +305,7 @@ fn worker(golden_emu: Arc<Emulator>, thread_id: usize, stats: Arc<Stats>) {
         // Update the statistics after completing a batch
         stats.fuzz_cases.fetch_add(BATCH_SIZE, Ordering::SeqCst);
         stats.instructions.fetch_add(instructions, Ordering::SeqCst);
+        stats.unique_crashes.fetch_add(unique_crashes, Ordering::SeqCst);
         stats.crashes.fetch_add(crashes, Ordering::SeqCst);
 
         stats.total_cycles.fetch_add(util::rdtsc() - it0, Ordering::SeqCst);

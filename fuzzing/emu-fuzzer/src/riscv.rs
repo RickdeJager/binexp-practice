@@ -189,6 +189,22 @@ impl Arch for RiscV {
         self.registers[Register::Sp as usize] = value;
     }
 
+    #[inline]
+    /// Set return values from hooked functions
+    fn set_return_value(&mut self, value: u64) {
+        self.registers[Register::A0 as usize] = value;
+    }
+
+    #[inline]
+    /// Pull the relevant registers for most function calls
+    fn get_function_arguments(&mut self) -> (u64, u64, u64) {
+        (
+            self.registers[Register::A1 as usize],
+            self.registers[Register::A2 as usize],
+            self.registers[Register::A3 as usize],
+        )
+    }
+
     fn set_register_raw(&mut self, reg: usize, value: u64) -> Option<()> {
         if reg >= NUM_REGISTERS {
             return None;
@@ -211,6 +227,12 @@ impl Arch for RiscV {
     #[inline]
     fn get_program_counter(&self) -> u64 {
         self.get_register(Register::Pc)
+    }
+
+    #[inline]
+    fn do_return(&mut self) {
+        // Jump to the current return address.
+        self.set_register(Register::Pc, self.get_register(Register::Ra));
     }
 
     #[inline]
@@ -237,11 +259,6 @@ impl Arch for RiscV {
         let pc = self.get_register(Register::Pc);
         // Fetch the current instruction
         let addr = VirtAddr(pc as usize);
-
-        // First resolve any callbacks
-        if let Some(callback) = break_map.get(&addr) {
-            callback(mmu)?
-        }
 
         let inst = mmu_read_perms!(mmu, addr, Perm(PERM_EXEC), u32)?;
         let opcode = inst & 0b1111111;
@@ -1169,7 +1186,7 @@ impl Arch for RiscV {
                         and rbx, rcx
                         shr rbx, 3
                         mov rdx, rbx
-                        or {store_size} [r9+ rax], {reg}
+                        or {store_size} [r9 + rax], {reg}
                         ; Check if this block is already marked dirty (if not, set it)
                         mov rcx, rax
                         shr rcx, {dirty_block_shamt}

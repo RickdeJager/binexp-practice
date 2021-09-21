@@ -101,6 +101,10 @@ pub fn write(mmu: &Mmu, fd: i64, p_buf: VirtAddr, count: u64) -> Result<i64, VmE
 }
 
 pub fn brk(mmu: &mut Mmu, size: i64) -> Result<i64, VmExit> {
+    if crate::HOOK_ALLOCATIONS {
+        unreachable!("Stray brk detected, this should have used malloc hooks instead");
+    }
+
     // If our current allocation suffices, just ret here.
     if size <= mmu.cur_alloc.0 as i64 {
         return Ok(mmu.cur_alloc.0 as i64);

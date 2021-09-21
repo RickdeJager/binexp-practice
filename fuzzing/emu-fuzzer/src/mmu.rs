@@ -1,4 +1,5 @@
 use crate::emu::VmExit;
+use std::collections::BTreeMap;
 
 pub const PERM_READ : u8 = 1 << 0;
 pub const PERM_WRITE: u8 = 1 << 1;
@@ -90,6 +91,10 @@ pub struct Mmu {
 
     /// The lowest address in the allocated stack.
     pub stack_location: VirtAddr,
+
+    /// A map that contains every address we've returned from malloc, along with the
+    /// allcocation size.
+    pub malloc_map: BTreeMap<VirtAddr, usize>,
 }
 
 impl Mmu {
@@ -108,6 +113,7 @@ impl Mmu {
             dirty_bitmap  : vec![0u64; size / DIRTY_BLOCK_SIZE / 64 + 1],
             cur_alloc     : VirtAddr(0x10000),
             stack_location: VirtAddr(0),
+            malloc_map    : BTreeMap::new(),
         }
     }
 
@@ -123,6 +129,7 @@ impl Mmu {
             dirty_bitmap  : vec![0u64; size / DIRTY_BLOCK_SIZE / 64 + 1],
             cur_alloc     : self.cur_alloc.clone(),
             stack_location: self.stack_location.clone(),
+            malloc_map    : self.malloc_map.clone(),
         }
     }
 
@@ -146,6 +153,20 @@ impl Mmu {
 
         // Clear the old dirty list
         self.dirty.clear();
+
+        // Clear the malloc_set
+        self.malloc_map.clear();
+        // Copy the malloc_set from the other memory state over.
+        self.malloc_map.extend(&other.malloc_map);
+
+        // Assert that the mmu's are identical after reset.
+        if crate::DEBUG_MODE {
+            assert!(self.cur_alloc == other.cur_alloc);
+            assert!(self.memory == other.memory);
+            assert!(self.permissions == other.permissions);
+            assert!(self.malloc_map == other.malloc_map);
+
+        }
     }
 
     /// Getter function to get all pointers required to run the JIT:
@@ -186,6 +207,21 @@ impl Mmu {
 
     /// Allocate a region of memory as RW.
     pub fn allocate(&mut self, size: usize) -> Option<VirtAddr> {
+        // Mark the new memory as uninitialized and writable by default.
+        let perms = match crate::ENABLE_RAW_PERM {
+            false => Perm(PERM_READ | PERM_WRITE),
+            true  => Perm(PERM_RAW | PERM_WRITE),
+        };
+        self.allocate_perms(size, perms)
+    }
+
+    /// Allocate with non-standard permissions
+    pub fn allocate_perms(&mut self, size: usize, perm: Perm) -> Option<VirtAddr> {
+        // Add some padding and alignment iff we're running a stricter allocator
+        let align_size = match crate::HOOK_ALLOCATIONS {
+            true  => (size + 0x1f) & !0xf,
+            false =>  size,
+        };
 
         // Get the current allocation base
         let base = self.cur_alloc;
@@ -196,18 +232,18 @@ impl Mmu {
         }
 
         // Update the allocation size (check for overflow)
-        self.cur_alloc = VirtAddr(self.cur_alloc.0.checked_add(size)?);
+        let new_base = VirtAddr(self.cur_alloc.0.checked_add(align_size)?);
 
         // Allocation would go out of memory, failed to alloc
-        if self.cur_alloc.0 > self.stack_location.0 {
+        if new_base.0 >= self.stack_location.0 {
             return None;
         }
 
-        // Mark the new memory as uninitialized and writable.
-        // TODO;
-        self.set_permissions(base, size, Perm(PERM_RAW | PERM_WRITE));
-        //self.set_permissions(base, size, Perm(PERM_READ | PERM_WRITE));
+        // Apply the new base in case the allocation succeeds.
+        self.cur_alloc = new_base;
 
+        // Apply permissions to the newly allocated memory
+        self.set_permissions(base, size, perm);
         Some(base)
     }
 
@@ -225,9 +261,11 @@ impl Mmu {
         let base = VirtAddr(self.memory.len() - size);
 
         // Mark the new memory as uninitialized and writable.
-        // TODO;
-        self.set_permissions(base, size, Perm(PERM_RAW | PERM_WRITE));
-        //self.set_permissions(base, size, Perm(PERM_READ | PERM_WRITE));
+        let perms = match crate::ENABLE_RAW_PERM {
+            false => Perm(PERM_READ | PERM_WRITE),
+            true  => Perm(PERM_RAW | PERM_WRITE),
+        };
+        self.set_permissions(base, size, perms);
 
         // Save the bottom of the stack
         self.stack_location = base;
@@ -242,6 +280,26 @@ impl Mmu {
             .get_mut(addr.0..addr.0.checked_add(size)?)?
             .iter_mut()
             .for_each(|x| *x = perm);
+
+        // Mark dirty blocks
+        let block_start = addr.0 / DIRTY_BLOCK_SIZE;
+        let block_end   = (addr.0 + size) / DIRTY_BLOCK_SIZE;
+
+        for block in block_start..=block_end {
+            // Determine the bitmap position of the dirty block
+            let idx = block / 64;
+            let bit = block % 64;
+
+            // Check if the block is not dirty
+            if self.dirty_bitmap[idx] & (1 << bit) == 0 {
+                // Block is not dirty yet, add it to the dirty list.
+                self.dirty.push(block);
+
+                // Update the dirty bitmap
+                self.dirty_bitmap[idx] |= 1 << bit;
+            }
+        }
+
         Some(())
     }
 

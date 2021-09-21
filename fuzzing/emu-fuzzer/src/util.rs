@@ -2,8 +2,11 @@ use crate::emu::VmExit;
 use crate::mmu::{Mmu, Perm, VirtAddr};
 use crate::mmu::{PERM_WRITE, PERM_READ, PERM_EXEC};
 
+use std::collections::HashMap;
+
 /// Load an elf from a slice of bytes, return the entry point on success.
-pub fn load_elf<'a>(contents: &'a [u8], mmu: &'a mut Mmu) -> Option<(u64, goblin::elf::Elf<'a>)> {
+pub fn load_elf<'a>(contents: &'a [u8], mmu: &'a mut Mmu) 
+    -> Option<(u64, HashMap<String, VirtAddr>)> {
 
     let binary = goblin::elf::Elf::parse(contents).ok()?;
     let entry = binary.entry;
@@ -49,7 +52,24 @@ pub fn load_elf<'a>(contents: &'a [u8], mmu: &'a mut Mmu) -> Option<(u64, goblin
         }
     }
 
-    Some((entry, binary))
+    let symbol_map = gen_symbol_map(&binary);
+    Some((entry, symbol_map))
+}
+
+/// Generate a symbol map based on an ELF file.
+pub fn gen_symbol_map(elf: &goblin::elf::Elf) -> HashMap<String, VirtAddr> {
+    let mut symbol_map = HashMap::new();
+
+    for symbol in elf.syms.iter() {
+        if let Some(named_symbol) = elf.strtab.get_at(symbol.st_name) {
+            // If we can resolve the symbol withing this binary...
+            if symbol.st_value != 0 {
+                // ... add it to the symbol map.
+                symbol_map.insert(named_symbol.to_owned(), VirtAddr(symbol.st_value as usize));
+            }
+        }
+    }
+    symbol_map
 }
 
 
